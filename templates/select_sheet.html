@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Select Google Sheet and Tabs as Buttons</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2rem; }
+    select { padding: 0.5rem; margin-bottom: 1rem; }
+    #tabsContainer {
+      margin-bottom: 1rem;
+    }
+    .tab-button {
+      padding: 0.5rem 1rem;
+      margin: 0 0.5rem 0.5rem 0;
+      border: 1px solid #007BFF;
+      background-color: white;
+      color: #007BFF;
+      cursor: pointer;
+      border-radius: 4px;
+      font-size: 1rem;
+    }
+    .tab-button.active {
+      background-color: #007BFF;
+      color: white;
+    }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+    th, td { border: 1px solid #ccc; padding: 8px; }
+    th { background-color: #f4f4f4; }
+  </style>
+</head>
+<body>
+  <h1>Select Google Sheet and Tab</h1>
+
+  <label for="sheetSelect">Choose a Google Sheet:</label>
+  <select id="sheetSelect">
+    <option value="">--Select Sheet--</option>
+  </select>
+
+  <div id="tabsContainer"></div>
+
+  <div id="dataContainer"></div>
+
+  <script>
+    const sheetSelect = document.getElementById('sheetSelect');
+    const tabsContainer = document.getElementById('tabsContainer');
+    const dataContainer = document.getElementById('dataContainer');
+    let activeTabButton = null;
+
+    // Load sheets on page load
+    fetch('/api/sheets')
+      .then(response => response.json())
+      .then(sheets => {
+        sheets.forEach(sheet => {
+          const option = document.createElement('option');
+          option.value = sheet;
+          option.textContent = sheet;
+          sheetSelect.appendChild(option);
+        });
+      });
+
+    sheetSelect.addEventListener('change', () => {
+      const sheetName = sheetSelect.value;
+      dataContainer.innerHTML = '';
+      tabsContainer.innerHTML = '';
+      activeTabButton = null;
+
+      if (!sheetName) return;
+
+      fetch(`/api/tabs/${encodeURIComponent(sheetName)}`)
+        .then(response => response.json())
+        .then(tabs => {
+          if (tabs.length === 0) {
+            tabsContainer.innerHTML = '<p>No tabs found for selected sheet.</p>';
+            return;
+          }
+          tabs.forEach(tab => {
+            const btn = document.createElement('button');
+            btn.textContent = tab;
+            btn.classList.add('tab-button');
+            btn.addEventListener('click', () => {
+              if (activeTabButton) activeTabButton.classList.remove('active');
+              btn.classList.add('active');
+              activeTabButton = btn;
+              loadTabData(sheetName, tab);
+            });
+            tabsContainer.appendChild(btn);
+          });
+        });
+    });
+
+    function loadTabData(sheetName, tabName) {
+      dataContainer.innerHTML = 'Loading data...';
+
+      fetch(`/api/data/${encodeURIComponent(sheetName)}/${encodeURIComponent(tabName)}`)
+        .then(response => response.json())
+        .then(rows => {
+          if (rows.length === 0) {
+            dataContainer.innerHTML = '<p>No data found in this tab.</p>';
+            return;
+          }
+
+          const table = document.createElement('table');
+          const thead = document.createElement('thead');
+          const tbody = document.createElement('tbody');
+
+          let maxCols = 0;
+          rows.forEach(row => {
+            if (row.length > maxCols) maxCols = row.length;
+          });
+
+          const headerRow = document.createElement('tr');
+          for (let i = 0; i < maxCols; i++) {
+            const th = document.createElement('th');
+            th.textContent = `Column ${i + 1}`;
+            headerRow.appendChild(th);
+          }
+          thead.appendChild(headerRow);
+          table.appendChild(thead);
+
+          rows.forEach(row => {
+            const tr = document.createElement('tr');
+            for (let i = 0; i < maxCols; i++) {
+              const td = document.createElement('td');
+              td.textContent = row[i] !== undefined ? row[i] : '';
+              tr.appendChild(td);
+            }
+            tbody.appendChild(tr);
+          });
+          table.appendChild(tbody);
+
+          dataContainer.innerHTML = '';
+          dataContainer.appendChild(table);
+        })
+        .catch(() => {
+          dataContainer.innerHTML = '<p>Error loading data.</p>';
+        });
+    }
+  </script>
+</body>
+</html>

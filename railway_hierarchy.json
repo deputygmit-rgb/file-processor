@@ -1,0 +1,211 @@
+{
+  "Indian Railways": {
+    "Zones": {
+      "Northern Railway": {
+        "Divisions": ["Delhi", "Ambala", "Firozpur", "Lucknow (NR)", "Moradabad"],
+        "Departments": {
+          "Engineering": ["Track Maintenance", "Bridge Engineering", "Civil Works", "Water Supply", "Land Management"],
+          "Mechanical": ["Rolling Stock Maintenance", "Workshop Operations", "Loco Sheds", "Wagon Maintenance"],
+          "Electrical": ["Traction Power Supply", "Train Lighting", "Air Conditioning", "Energy Management"],
+          "Signal and Telecommunication": ["Signalling Systems", "Telecommunication Maintenance", "Train Control"],
+          "Traffic (Operations)": ["Train Control", "Timetabling", "Punctuality", "Crew Management"],
+          "Commercial": ["Passenger Services", "Freight Operations", "Catering", "Ticketing", "Customer Relations"],
+          "Accounts": ["Budgeting", "Auditing", "Cost Accounting", "Payroll"],
+          "Personnel": ["Recruitment", "Training", "Staff Welfare", "Pension Management"],
+          "Safety": ["Safety Audits", "Accident Investigation", "Inspections"],
+          "Security": ["RPF Operations", "Station Security", "Train Escort"],
+          "Medical": ["Health Services", "Medical Examinations"],
+          "IT / Systems": ["E-Office", "Digital Records", "MIS Systems"]
+        }
+      },
+      "North Eastern Railway": {
+        "Divisions": ["Izzatnagar", "Lucknow (NER)", "Varanasi"],
+        "Departments": {
+          "Engineering": ["Track Maintenance", "Bridge Works", "Buildings"],
+          "Mechanical": ["Coach Maintenance", "Workshop Operations"],
+          "Electrical": ["Traction Power", "Train Lighting"],
+          "Signal and Telecommunication": ["Signalling", "Telecom Maintenance"],
+          "Commercial": ["Freight", "Passenger Services"],
+          "Accounts": ["Finance", "Audit"],
+          "Personnel": ["Recruitment", "Training"]
+        }
+      },
+      "Northeast Frontier Railway": {
+        "Divisions": ["Katihar", "Alipurduar", "Lumding", "Rangiya", "Tinsukia"],
+        "Departments": {
+          "Engineering": ["Track", "Bridge Works", "Landslides Management"],
+          "Mechanical": ["Loco Sheds", "Workshop"],
+          "Electrical": ["Traction Power", "Substation Maintenance"],
+          "Signal and Telecommunication": ["Train Detection", "Signalling Systems"],
+          "Commercial": ["Passenger", "Freight", "Tourism"],
+          "Security": ["RPF Operations"],
+          "Safety": ["Safety Drives"]
+        }
+      },
+      "Eastern Railway": {
+        "Divisions": ["Howrah", "Sealdah", "Asansol", "Malda"],
+        "Departments": {
+          "Engineering": ["Track Maintenance", "Bridge Inspection"],
+          "Mechanical": ["Loco Maintenance", "Workshops"],
+          "Electrical": ["Power Supply", "Lighting"],
+          "Signal and Telecommunication": ["Signalling Systems", "Telecommunication"],
+          "Commercial": ["Passenger Services", "Freight Marketing"],
+          "Accounts": ["Audit", "Finance"],
+          "Safety": ["Inspections"]
+        }
+      },
+      "South Eastern Railway": {
+        "Divisions": ["Kharagpur", "Adra", "Chakradharpur", "Ranchi"],
+        "Departments": {
+          "Engineering": ["Track", "Bridge Works"],
+          "Mechanical": ["Wagon Maintenance", "Workshop"],
+          "Electrical": ["Traction", "Energy Efficiency"],
+          "Signal and Telecommunication": ["Signalling", "Telecom"],
+          "Commercial": ["Ticketing", "Freight"],
+          "Safety": ["Inspections"]
+        }
+      },
+      "South Central Railway": {
+        "Divisions": ["Secunderabad", "Hyderabad", "Vijayawada", "Guntur", "Guntakal", "Nanded"],
+        "Departments": {
+          "Engineering": ["Track Maintenance", "Bridges", "Buildings"],
+          "Mechanical": ["Rolling Stock", "Workshops"],
+          "Electrical": ["Traction", "Power Supply"],
+          "Signal and Telecommunication": ["Signalling Systems", "Telecom Maintenance"],
+          "Commercial": ["Passenger", "Freight"],
+          "Safety": ["Audit"]
+        }
+      },
+      "Southern Railway": {
+        "Divisions": ["Chennai", "Madurai", "Salem", "Palakkad", "Tiruchirappalli", "Thiruvananthapuram"],
+        "Departments": {
+          "Engineering": ["Track Maintenance", "Bridge Engineering", "Civil Works", "Land Management"],
+          "Mechanical": ["Rolling Stock Maintenance", "Workshops", "Loco Sheds"],
+          "Electrical": ["Traction Power", "Train Lighting", "AC Systems"],
+          "Signal and Telecommunication": ["Signalling Systems", "Telecom", "Train Control"],
+          "Traffic (Operations)": ["Train Control", "Punctuality Monitoring"],
+          "Commercial": ["Passenger", "Freight", "Catering"],
+          "Accounts": ["Finance", "Audit"],
+          "Personnel": ["Recruitment", "Welfare"],
+          "Safety": ["Inspections", "Accident Prevention"],
+          "Security": ["RPF", "Escort"],
+          "Medical": ["Health Services"]
+        }
+      },
+      "South Western Railway": {
+        "Divisions": ["Hubballi", "Bengaluru", "Mysuru"],
+        "Departments": {
+          "Engineering": ["Track", "Bridge Works"],
+          "Mechanical": ["Rolling Stock", "Workshops"],
+          "Electrical": ["Power Supply", "Lighting"],
+          "Signal and Telecommunication": ["Signalling", "Telecom"],
+          "Commercial": ["Passenger", "Freight"],
+          "Safety": ["Audit"]
+        }
+      },
+      "Western Railway": {
+        "Divisions": ["Mumbai Central", "Vadodara", "Ahmedabad", "Rajkot", "Ratlam", "Bhavnagar"],
+        "Departments": {
+          "Engineering": ["Track Maintenance", "Bridge Works", "Civil"],
+          "Mechanical": ["Coach Maintenance", "Workshops"],
+          "Electrical": ["Traction", "Energy Efficiency"],
+          "Signal and Telecommunication": ["Signalling", "Telecommunication"],
+          "Commercial": ["Ticketing", "Freight"],
+          "Accounts": ["Finance", "Audit"]
+        }
+      },
+      "Central Railway": {
+        "Divisions": ["Mumbai", "Pune", "Bhusawal", "Nagpur", "Solapur"],
+        "Departments": {
+          "Engineering": ["Track", "Bridge Works", "Civil"],
+          "Mechanical": ["Rolling Stock", "Workshops"],
+          "Electrical": ["Traction", "Lighting"],
+          "Signal and Telecommunication": ["Signalling", "Telecom"],
+          "Commercial": ["Passenger", "Freight"],
+          "Accounts": ["Finance", "Audit"],
+          "Safety": ["Inspection"]
+        }
+      },
+      "East Coast Railway": {
+        "Divisions": ["Khurda Road", "Sambalpur", "Waltair"],
+        "Departments": {
+          "Engineering": ["Track", "Bridge Works"],
+          "Mechanical": ["Workshops", "Sheds"],
+          "Electrical": ["Traction", "Lighting"],
+          "Signal and Telecommunication": ["Signalling", "Telecom"],
+          "Commercial": ["Passenger", "Freight"]
+        }
+      },
+      "East Central Railway": {
+        "Divisions": ["Danapur", "Dhanbad", "Mughalsarai", "Samastipur", "Sonpur"],
+        "Departments": {
+          "Engineering": ["Track", "Bridge"],
+          "Mechanical": ["Rolling Stock"],
+          "Electrical": ["Power Supply"],
+          "Signal and Telecommunication": ["Signalling"],
+          "Commercial": ["Freight", "Passenger"]
+        }
+      },
+      "North Central Railway": {
+        "Divisions": ["Agra", "Jhansi", "Prayagraj"],
+        "Departments": {
+          "Engineering": ["Track", "Bridge"],
+          "Mechanical": ["Rolling Stock"],
+          "Electrical": ["Traction"],
+          "Signal and Telecommunication": ["Signalling", "Telecom"],
+          "Commercial": ["Passenger", "Freight"]
+        }
+      },
+      "North Western Railway": {
+        "Divisions": ["Jaipur", "Ajmer", "Bikaner", "Jodhpur"],
+        "Departments": {
+          "Engineering": ["Track", "Bridge Works"],
+          "Mechanical": ["Workshops", "Rolling Stock"],
+          "Electrical": ["Traction", "Lighting"],
+          "Signal and Telecommunication": ["Signalling"],
+          "Commercial": ["Freight", "Passenger"]
+        }
+      },
+      "South East Central Railway": {
+        "Divisions": ["Bilaspur", "Raipur", "Nagpur (SEC)"],
+        "Departments": {
+          "Engineering": ["Track", "Bridge"],
+          "Mechanical": ["Workshops"],
+          "Electrical": ["Traction", "Power"],
+          "Signal and Telecommunication": ["Signalling"],
+          "Commercial": ["Passenger", "Freight"]
+        }
+      },
+      "West Central Railway": {
+        "Divisions": ["Bhopal", "Kota", "Jabalpur"],
+        "Departments": {
+          "Engineering": ["Track", "Bridge Works"],
+          "Mechanical": ["Rolling Stock"],
+          "Electrical": ["Power Supply"],
+          "Signal and Telecommunication": ["Signalling"],
+          "Commercial": ["Passenger", "Freight"]
+        }
+      },
+      "South Coast Railway": {
+        "Divisions": ["Vijayawada", "Guntur", "Guntakal"],
+        "Departments": {
+          "Engineering": ["Track", "Bridge Works"],
+          "Mechanical": ["Rolling Stock"],
+          "Electrical": ["Traction"],
+          "Signal and Telecommunication": ["Signalling"],
+          "Commercial": ["Passenger", "Freight"]
+        }
+      },
+      "Konkan Railway": {
+        "Divisions": ["Panvel", "Ratnagiri", "Madgaon"],
+        "Departments": {
+          "Engineering": ["Track Maintenance", "Bridge Works"],
+          "Mechanical": ["Rolling Stock"],
+          "Electrical": ["Traction Power"],
+          "Signal and Telecommunication": ["Signalling", "Telecommunication"],
+          "Commercial": ["Freight", "Passenger"]
+        }
+      }
+    }
+  }
+}

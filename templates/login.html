@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Login with Email OTP</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 20px; }
+    .container { max-width: 400px; margin: auto; }
+    input, button { width: 100%; padding: 10px; margin: 5px 0; }
+    #message { margin-top: 10px; color: red; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Email Login</h2>
+
+    <!-- Step 1: Request OTP -->
+    <form id="requestForm">
+      <input type="email" id="email" placeholder="Enter your email" required />
+      <button type="submit">Request OTP</button>
+    </form>
+
+    <!-- Step 2: Verify OTP -->
+    <form id="verifyForm" style="display:none;">
+      <input type="text" id="otp" placeholder="Enter OTP" required />
+      <button type="submit">Verify OTP</button>
+    </form>
+
+    <div id="message"></div>
+  </div>
+
+  <script>
+    const requestForm = document.getElementById("requestForm");
+    const verifyForm = document.getElementById("verifyForm");
+    const msg = document.getElementById("message");
+    let email = "";
+
+    // Helper to safely parse JSON
+    async function safeJson(res) {
+      const text = await res.text();
+      try {
+        return JSON.parse(text);
+      } catch {
+        return {error: "Server returned invalid response", raw: text};
+      }
+    }
+
+    // Request OTP
+    requestForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      email = document.getElementById("email").value;
+      try {
+        const res = await fetch("http://127.0.0.1:5006//request_otp", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({email})
+        });
+
+        const data = await safeJson(res);
+        msg.innerText = data.message || data.error;
+
+        if (res.ok) {
+          requestForm.style.display = "none";
+          verifyForm.style.display = "block";
+        }
+      } catch (err) {
+        msg.innerText = "Network error: " + err.message;
+      }
+    });
+
+    // Verify OTP
+    verifyForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const otp = document.getElementById("otp").value;
+      try {
+        const res = await fetch("http://127.0.0.1:5006/verify_otp", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({email, otp})
+        });
+
+        const data = await safeJson(res);
+        msg.innerText = data.message || data.error;
+
+        if (res.ok) {
+          // Redirect to dashboard
+          window.location.href = "/dashboard";
+        }
+      } catch (err) {
+        msg.innerText = "Network error: " + err.message;
+      }
+    });
+  </script>
+</body>
+</html>

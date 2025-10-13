@@ -1,0 +1,49 @@
+﻿/* General Soft UI Look */
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+.card {
+    border-radius: 15px;
+    background: #ffffff;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.05);
+}
+
+.billboard {
+    border-radius: 15px;
+    background: linear-gradient(to bottom right, #f9f9f9, #ffffff);
+}
+
+/* Navbar styling */
+.navbar {
+    border-radius: 0 0 15px 15px;
+}
+
+/* Smooth hover for buttons */
+.btn {
+    border-radius: 30px;
+    transition: all 0.2s ease-in-out;
+}
+
+.btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 10px rgba(0,0,0,0.15);
+}
+
+/* Smooth scrolling marquee alternative (if JS replaces <marquee>) */
+.smooth-scroll {
+    overflow: hidden;
+    height: 200px;
+    position: relative;
+}
+
+.scroll-content {
+    position: absolute;
+    width: 100%;
+    animation: scrollUp 10s linear infinite;
+}
+
+@keyframes scrollUp {
+    0% { top: 100%; }
+    100% { top: -100%; }
+}

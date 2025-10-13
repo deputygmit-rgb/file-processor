@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+  <h2>{{ file.filename }} ({{ file.filetype|upper }})</h2>
+
+  <div class="mb-3">
+    <a href="{{ url_for('export_download_file', file_id=file.file_id) }}" class="btn btn-sm btn-outline-secondary mb-2" target="_blank">Download Original File</a>
+    <a href="{{ url_for('export_file_excel', file_id=file._id|string) }}" class="btn btn-outline-success">Export Excel</a>
+    <a href="{{ url_for('export_file_word', file_id=file._id) }}" class="btn btn-outline-success">Export Word</a>
+
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    {% set search_terms = query.split() %}
+    {% if file.filetype == 'pdf' %}
+      {% for page in file.data %}
+        {% set page_text = page.text|default('') %}
+        <div class="tab {% if loop.first %}active{% endif %}" 
+             onclick="showTab('{{ file._id }}', 'page-{{ loop.index }}', event)">
+          Page {{ page.page_number }}
+        </div>
+      {% endfor %}
+    {% elif file.filetype == 'pptx' %}
+      {% for slide in file.data %}
+        {% set slide_text = slide.texts|join(' ') %}
+        <div class="tab {% if loop.first %}active{% endif %}" 
+             onclick="showTab('{{ file._id }}', 'slide-{{ loop.index }}', event)">
+          Slide {{ loop.index }}
+        </div>
+      {% endfor %}
+    {% elif file.filetype == 'xlsx' %}
+      {% for sheet_name, rows in file.data.items() %}
+        <div class="tab {% if loop.first %}active{% endif %}" 
+             onclick="showTab('{{ file._id }}', 'sheet-{{ loop.index }}', event)">
+          Sheet {{ sheet_name }}
+        </div>
+      {% endfor %}
+    {% endif %}
+  </div>
+
+  <!-- Tab Contents -->
+  {% macro highlight_text(text, terms) %}
+    {% for term in terms %}
+      {% set text = text|replace(term, '<span class="highlight">' ~ term ~ '</span>', ignorecase=True) %}
+    {% endfor %}
+    {{ text|safe }}
+  {% endmacro %}
+
+  {% if file.filetype == 'pdf' %}
+    {% for page in file.data %}
+      <div id="page-{{ loop.index }}-{{ file._id }}" class="tab-content {% if loop.first %}active{% endif %}">
+        <pre>{{ highlight_text(page.text|default(''), search_terms) }}</pre>
+      </div>
+    {% endfor %}
+  {% elif file.filetype == 'pptx' %}
+    {% for slide in file.data %}
+      <div id="slide-{{ loop.index }}-{{ file._id }}" class="tab-content {% if loop.first %}active{% endif %}">
+        <pre>{{ highlight_text(slide.texts|join(' '), search_terms) }}</pre>
+        {% if slide.images %}
+          <div class="mt-2">
+            {% for img in slide.images %}
+              <img src="{{ url_for('serve_image', image_id=img.id) }}" class="ppt-image" />
+            {% endfor %}
+          </div>
+        {% endif %}
+      </div>
+    {% endfor %}
+  {% elif file.filetype == 'xlsx' %}
+    {% for sheet_name, rows in file.data.items() %}
+      <div id="sheet-{{ loop.index }}-{{ file._id }}" class="tab-content {% if loop.first %}active{% endif %}">
+        <table class="table table-bordered table-sm">
+          {% for row in rows[:50] %}
+            <tr>
+              {% for cell in row %}
+                <td>{{ highlight_text(cell|string, search_terms) }}</td>
+              {% endfor %}
+            </tr>
+          {% endfor %}
+        </table>
+        {% if rows|length > 50 %}
+          <p class="text-muted">... preview limited to 50 rows ...</p>
+        {% endif %}
+      </div>
+    {% endfor %}
+  {% endif %}
+</div>
+
+<style>
+  .highlight { background: yellow; font-weight: bold; }
+  .tab { display: inline-block; padding: 8px 12px; margin-right: 5px; border-radius: 6px 6px 0 0; background: #e9ecef; cursor: pointer; }
+  .tab.active { background: #007bff; color: white; }
+  .tab-content { display: none; padding: 15px; background: #fff; border: 1px solid #ddd; border-radius: 0 0 10px 10px; }
+  .tab-content.active { display: block; }
+  img.ppt-image { max-width: 300px; margin: 5px; border: 1px solid #ccc; border-radius: 4px; }
+</style>
+
+<script>
+  function showTab(fileId, tabId, evt) {
+    document.querySelectorAll(`#file-${fileId} .tab-content`).forEach(c => c.classList.remove('active'));
+    document.querySelectorAll(`#file-${fileId} .tab`).forEach(t => t.classList.remove('active'));
+    document.getElementById(tabId + "-" + fileId).classList.add('active');
+    if(evt) evt.currentTarget.classList.add('active');
+  }
+
+  // On page load, show the first tab
+  window.onload = function() {
+    const firstTabContent = document.querySelector('.tab-content.active');
+    if(firstTabContent) firstTabContent.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+</script>
+{% endblock %}

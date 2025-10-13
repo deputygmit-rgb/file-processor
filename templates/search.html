@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="container mt-4">
+  <h2>Search Documents</h2>
+
+  <!-- Search Form -->
+  <form method="get" action="{{ url_for('search') }}" class="mb-3">
+    <div class="input-group">
+      <input type="text" name="q" value="{{ query }}" class="form-control" placeholder="Search files, text, or OCR data..." />
+      <button class="btn btn-primary" type="submit">Search</button>
+    </div>
+
+    <!-- Summarization / Analysis checkboxes -->
+    <div class="form-check form-check-inline mt-2">
+      <input class="form-check-input" type="checkbox" name="summarize" value="true" id="summarize" {% if request.args.get('summarize') == 'true' %}checked{% endif %}>
+      <label class="form-check-label" for="summarize">AI Summarize</label>
+    </div>
+    <div class="form-check form-check-inline">
+      <input class="form-check-input" type="checkbox" name="analyze" value="true" id="analyze" {% if request.args.get('analyze') == 'true' %}checked{% endif %}>
+      <label class="form-check-label" for="analyze">Analyze</label>
+    </div>
+  </form>
+
+  {% if query %}
+    <h5 class="mt-3">Results for "{{ query }}"</h5>
+
+    <!-- 🧠 Optional Combined AI Summary -->
+    {% if summary %}
+      <div class="card my-3 border-primary">
+        <div class="card-header bg-primary text-white">
+          <i class="bi bi-lightbulb"></i> AI Summary (Overall)
+        </div>
+        <div class="card-body">
+          <p class="mb-0">{{ summary }}</p>
+        </div>
+      </div>
+    {% endif %}
+
+    <!-- 📊 Analysis Section -->
+    {% if analysis %}
+      <div class="card my-3 border-info">
+        <div class="card-header bg-info text-white">
+          <i class="bi bi-bar-chart"></i> Analysis
+        </div>
+        <div class="card-body">
+          {% if analysis.keywords %}
+            <h6>Top Keywords</h6>
+            <p>
+              {% for kw in analysis.keywords %}
+                <span class="badge bg-secondary me-1">{{ kw }}</span>
+              {% endfor %}
+            </p>
+          {% endif %}
+          {% if analysis.entities %}
+            <h6>Named Entities</h6>
+            <ul class="list-inline">
+              {% for ent in analysis.entities %}
+                <li class="list-inline-item">
+                  <span class="badge bg-light text-dark border">{{ ent.text }} <small class="text-muted">({{ ent.entity }})</small></span>
+                </li>
+              {% endfor %}
+            </ul>
+          {% endif %}
+        </div>
+      </div>
+    {% endif %}
+
+    {% if results %}
+      <p class="text-muted">Showing {{ results|length }} result(s) — sorted by boosted relevance.</p>
+
+      <ul class="list-group mt-3">
+        {% for file in results %}
+          <li class="list-group-item">
+            <div class="d-flex justify-content-between align-items-start">
+              <div>
+                <strong>{{ loop.index }}. {{ file.filename }}</strong>
+                <small class="text-muted"> ({{ file.filetype }})</small>
+                <div class="text-muted small">📅 Uploaded: {{ file._upload_time_str }}</div>
+              </div>
+              <div class="text-end">
+                <div><b>Score:</b> {{ file.score|default(0.0)|float|round(3) }}</div>
+                {% if file.boost is defined %}
+                  <div class="text-primary small">+ Boost: {{ file.boost|float|round(2) }}</div>
+                {% endif %}
+              </div>
+            </div>
+
+            {% if file._snippet %}
+              <div class="mt-2">
+                <small>{{ file._snippet|safe }}</small>
+              </div>
+            {% endif %}
+
+            <!-- 🧠 Per-Document AI Summary -->
+            {% if file.summary %}
+              <div class="card mt-3 border-primary">
+                <div class="card-header bg-light text-primary py-1">
+                  <small><i class="bi bi-stars"></i> AI Summary for this Document</small>
+                </div>
+                <div class="card-body py-2">
+                  <p class="mb-0 small">{{ file.summary }}</p>
+                </div>
+              </div>
+            {% endif %}
+
+            {% if file.phrase_hits is defined or file.word_hits is defined %}
+              <div class="mt-2 text-muted small">
+                <span>🔍 Phrase matches: {{ file.phrase_hits|default(0) }}</span> |
+                <span>Word matches: {{ file.word_hits|default(0) }}</span>
+              </div>
+            {% endif %}
+
+            <!-- Relevance Bar -->
+            {% if file.score is defined %}
+              <div class="progress mt-2" style="height: 6px;">
+                <div class="progress-bar bg-success" role="progressbar"
+                     style="width: {{ (file.score * 40)|int }}%;"
+                     aria-valuenow="{{ (file.score * 40)|int }}" aria-valuemin="0" aria-valuemax="100">
+                </div>
+              </div>
+            {% endif %}
+
+            <!-- Buttons -->
+            <div class="mt-3">
+              <a href="{{ url_for('export_download_file', file_id=file.file_id) }}" class="btn btn-sm btn-outline-secondary" target="_blank">Download</a>
+              <a href="{{ url_for('export_json', file_id=file._id) }}" class="btn btn-sm btn-outline-info">Export JSON</a>
+              <a href="{{ url_for('export_excel', file_id=file._id) }}" class="btn btn-sm btn-outline-success">Export Excel</a>
+              <a href="{{ url_for('file_detail', file_id=file._id) }}" class="btn btn-sm btn-primary">View File</a>
+            </div>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="text-muted mt-3">No results found.</p>
+    {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

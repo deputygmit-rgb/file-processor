@@ -1,0 +1,243 @@
+{% extends "base.html" %}
+{% block content %}
+<head>
+  <meta charset="UTF-8" />
+  <title>Uploaded Files Dashboard</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <style>
+    pre {
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+    img {
+      max-width: 100%;
+      margin-bottom: 10px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+    }
+    .file-card {
+      display: none;
+    }
+    .ppt-image, .pdf-image, .img-file-image {
+      max-width: 300px;
+      margin: 5px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+<div class="container mt-4">
+  <h1>Uploaded Files Dashboard</h1>
+
+  <div class="mb-3">
+    <label for="fileSelect" class="form-label">Select a file:</label>
+    <select id="fileSelect" class="form-select" onchange="showSelectedFile(this.value)">
+      <option value="">-- Select a file --</option>
+      {% for file in files %}
+        <option value="{{ file._id }}" {% if file._id == selected_file_id %}selected{% endif %}>
+          {{ file.filename }}
+        </option>
+      {% endfor %}
+    </select>
+
+  </div>
+
+  <a href="{{ url_for('upload') }}" class="btn btn-primary mb-3">Upload New File</a>
+
+  {% if not files %}
+    <p>No files uploaded yet.</p>
+  {% endif %}
+
+  {% for file in files %}
+    <div id="file-{{ file._id }}" class="file-card">
+      <h3>{{ file.filename }} ({{ file.filetype|default('unknown')|upper }})</h3>
+      <a href="{{ url_for('serve_file', file_id=file.file_id) }}" class="btn btn-sm btn-outline-secondary mb-2" target="_blank">Download Original File</a>
+      <a href="{{ url_for('export_json', file_id=file._id) }}" class="btn btn-sm btn-outline-info mb-2 ms-2" target="_blank">Export Data as JSON</a>
+      <a href="{{ url_for('export_excel', file_id=file._id) }}" class="btn btn-sm btn-outline-success mb-2 ms-2" target="_blank">Export Data to Excel</a>
+      <a href="{{ url_for('export_word', file_id=file._id) }}" class="btn btn-sm btn-outline-primary mb-2 ms-2" target="_blank">Export Data to Word</a>
+      {% if file.filetype == 'xlsx' %}
+        <ul class="nav nav-tabs" id="tabs-{{ file._id }}" role="tablist">
+          {% for sheet_name in file.data.keys() %}
+            <li class="nav-item" role="presentation">
+              <button class="nav-link {% if loop.first %}active{% endif %}" id="tab-{{ file._id }}-sheet-{{ loop.index }}" data-bs-toggle="tab" data-bs-target="#tab-content-{{ file._id }}-sheet-{{ loop.index }}" type="button" role="tab" aria-controls="tab-content-{{ file._id }}-sheet-{{ loop.index }}" aria-selected="{{ 'true' if loop.first else 'false' }}">
+                {{ sheet_name }}
+              </button>
+            </li>
+          {% endfor %}
+        </ul>
+        <div class="tab-content mt-3" id="tabs-content-{{ file._id }}">
+          {% for sheet_name, rows in file.data.items() %}
+            <div class="tab-pane fade {% if loop.first %}show active{% endif %}" id="tab-content-{{ file._id }}-sheet-{{ loop.index }}" role="tabpanel" aria-labelledby="tab-{{ file._id }}-sheet-{{ loop.index }}">
+              <div class="table-responsive">
+                <table class="table table-bordered table-sm">
+                  <tbody>
+                    {% for row in rows %}
+                      <tr>
+                        {% for cell in row %}
+                          <td>{{ cell }}</td>
+                        {% endfor %}
+                      </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+
+      {% elif file.filetype == 'pptx' %}
+        <ul class="nav nav-tabs" id="tabs-{{ file._id }}" role="tablist">
+          {% for slide in file.data %}
+            <li class="nav-item" role="presentation">
+              <button class="nav-link {% if loop.first %}active{% endif %}" id="tab-{{ file._id }}-slide-{{ loop.index }}" data-bs-toggle="tab" data-bs-target="#tab-content-{{ file._id }}-slide-{{ loop.index }}" type="button" role="tab" aria-controls="tab-content-{{ file._id }}-slide-{{ loop.index }}" aria-selected="{{ 'true' if loop.first else 'false' }}">
+                Slide {{ loop.index }}
+              </button>
+            </li>
+          {% endfor %}
+        </ul>
+        <div class="tab-content mt-3" id="tabs-content-{{ file._id }}">
+          {% for slide in file.data %}
+            <div class="tab-pane fade {% if loop.first %}show active{% endif %}" id="tab-content-{{ file._id }}-slide-{{ loop.index }}" role="tabpanel" aria-labelledby="tab-{{ file._id }}-slide-{{ loop.index }}">
+              <h5>{{ slide.title or '(No Title)' }}</h5>
+              {% for text in slide.texts %}
+                <p>{{ text }}</p>
+              {% endfor %}
+              {% for table in slide.tables %}
+                <div class="table-responsive mb-3">
+                  <table class="table table-bordered table-sm">
+                    <tbody>
+                      {% for row in table %}
+                        <tr>
+                          {% for cell in row %}
+                            <td>{{ cell }}</td>
+                          {% endfor %}
+                        </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+              {% endfor %}
+              {% if slide.images %}
+                <h6>Images</h6>
+                <div>
+                  {% for image in slide.images %}
+                    <img src="{{ url_for('serve_image', image_id=image.id) }}" alt="Slide Image" class="ppt-image" loading="lazy" />
+                  {% endfor %}
+                </div>
+              {% endif %}
+            </div>
+          {% endfor %}
+        </div>
+
+      {% elif file.filetype == 'pdf' %}
+        <ul class="nav nav-tabs" id="tabs-{{ file._id }}" role="tablist">
+          {% for page in file.data %}
+            <li class="nav-item" role="presentation">
+              <button class="nav-link {% if loop.first %}active{% endif %}" id="tab-{{ file._id }}-page-{{ page.page_number }}" data-bs-toggle="tab" data-bs-target="#tab-content-{{ file._id }}-page-{{ page.page_number }}" type="button" role="tab" aria-controls="tab-content-{{ file._id }}-page-{{ page.page_number }}" aria-selected="{{ 'true' if loop.first else 'false' }}">
+                Page {{ page.page_number }}
+              </button>
+            </li>
+          {% endfor %}
+        </ul>
+        <div class="tab-content mt-3" id="tabs-content-{{ file._id }}">
+          {% for page in file.data %}
+            <div class="tab-pane fade {% if loop.first %}show active{% endif %}" id="tab-content-{{ file._id }}-page-{{ page.page_number }}" role="tabpanel" aria-labelledby="tab-{{ file._id }}-page-{{ page.page_number }}">
+              <h5>Extracted Text</h5>
+              <pre>{{ page.text }}</pre>
+
+              {% if page.tables %}
+                <h6>Extracted Tables:</h6>
+                {% for table in page.tables %}
+                  <div class="table-responsive mb-3">
+                    <table class="table table-bordered table-sm">
+                      <tbody>
+                        {% for row in table %}
+                          <tr>
+                            {% for cell in row %}
+                              <td>{{ cell or '' }}</td>
+                            {% endfor %}
+                          </tr>
+                        {% endfor %}
+                      </tbody>
+                    </table>
+                  </div>
+                {% endfor %}
+              {% endif %}
+
+              {% if page.image_texts %}
+                <h6>OCR Text from Images:</h6>
+                {% for text in page.image_texts %}
+                  <pre>{{ text }}</pre>
+                {% endfor %}
+              {% endif %}
+
+              {% if page.images %}
+                <h6>Images</h6>
+                <div>
+                  {% for image in page.images %}
+                    <img src="{{ url_for('serve_image', image_id=image.id) }}" alt="PDF Image" class="pdf-image" />
+                  {% endfor %}
+                </div>
+              {% endif %}
+            </div>
+          {% endfor %}
+        </div>
+
+      {% elif file.filetype in ['png','jpg','jpeg','bmp','gif','tiff'] %}
+        <div class="mb-3">
+          <h5>Extracted OCR Text</h5>
+          <pre>{{ file.data.ocr_text or '(No text extracted)' }}</pre>
+        </div>
+        {% if file.data.images %}
+          <div>
+            <h6>Uploaded Image</h6>
+            {% for image in file.data.images %}
+              <img src="{{ url_for('serve_image', image_id=image.id) }}" alt="Uploaded Image" class="img-file-image" />
+            {% endfor %}
+          </div>
+        {% endif %}
+
+      {% else %}
+        <p>No data preview available for this file type.</p>
+      {% endif %}
+    </div>
+  {% endfor %}
+</div>
+
+<script>
+  function showSelectedFile(selectedId = null) {
+  const cards = document.querySelectorAll('.file-card');
+  cards.forEach(card => {
+    if (selectedId && card.id === 'file-' + selectedId) {
+      card.style.display = 'block';
+      card.style.border = "2px solid #007bff";
+      card.style.backgroundColor = "#eef6ff";
+      card.scrollIntoView({ behavior: "smooth", block: "start" });
+    } else {
+      card.style.display = 'none';
+      card.style.border = '';
+      card.style.backgroundColor = '';
+    }
+  });
+
+  const selectEl = document.getElementById('fileSelect');
+  if (selectEl && selectedId) selectEl.value = selectedId;
+}
+
+ window.onload = function() {
+  const selectedIdFromServer = "{{ selected_file_id or '' }}";
+  const select = document.getElementById('fileSelect');
+  if (selectedIdFromServer) {
+    showSelectedFile(selectedIdFromServer);
+  } else if (select && select.options.length > 1) {
+    select.selectedIndex = 1;
+    showSelectedFile(select.value);
+  }
+};
+
+</script>
+
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+{% endblock %}

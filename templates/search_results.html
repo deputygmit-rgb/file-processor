@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Search Results</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #f8f9fa; margin: 0; padding: 0; }
+    header { background: #343a40; color: white; padding: 15px; }
+    .container { margin: 20px; }
+    .file-card { background: white; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 15px; margin-bottom: 20px; }
+    .file-header { display: flex; justify-content: space-between; align-items: center; }
+    .tabs { margin-top: 10px; }
+    .tab { display: inline-block; padding: 8px 12px; margin-right: 5px; border-radius: 6px 6px 0 0; background: #e9ecef; cursor: pointer; }
+    .tab.active { background: #007bff; color: white; }
+    .tab-content { display: none; padding: 15px; background: #fff; border: 1px solid #ddd; border-radius: 0 0 10px 10px; }
+    .tab-content.active { display: block; }
+    pre { background: #f1f3f5; padding: 10px; border-radius: 8px; white-space: pre-wrap; word-wrap: break-word; }
+    .highlight { background: yellow; font-weight: bold; }
+    .snippet { margin-top: 10px; font-style: italic; }
+    a.btn { text-decoration: none; background: #28a745; color: white; padding: 6px 12px; border-radius: 6px; margin-left: 10px; }
+    table { border-collapse: collapse; width: 100%; }
+    td, th { border: 1px solid #ccc; padding: 4px 6px; max-width: 200px; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <header>
+    <h2>Search Results for "{{ query }}"</h2>
+  </header>
+  <div class="container">
+
+    {% if not files %}
+      <p>No matching results found.</p>
+    {% endif %}
+
+    {% for file in files %}
+    <div class="file-card" id="file-{{ file._id }}">
+      <div class="file-header">
+        <h3>{{ file.filename }}</h3>
+        <div>
+          <span>Uploaded: {{ file._upload_time.strftime("%Y-%m-%d %H:%M:%S") }}</span>
+          <a class="btn" href="{{ url_for('serve_file', file_id=file._id) }}">Download</a>
+        </div>
+      </div>
+
+      <!-- Tabs -->
+      <div class="tabs">
+        {% set search_terms = query.split() %}
+        {% if file.filetype == 'pdf' %}
+          {% for page in file.data %}
+            {% set page_text = page.text|default('') %}
+            <div class="tab {% if search_terms|select('in', page_text|lower)|list %}active{% endif %}" 
+                 onclick="showTab('{{ file._id }}', 'page-{{ loop.index }}', event)">
+              Page {{ page.page_number }}
+            </div>
+          {% endfor %}
+        {% elif file.filetype == 'pptx' %}
+          {% for slide in file.data %}
+            {% set slide_text = slide.texts|join(' ') %}
+            <div class="tab {% if search_terms|select('in', slide_text|lower)|list %}active{% endif %}" 
+                 onclick="showTab('{{ file._id }}', 'slide-{{ loop.index }}', event)">
+              Slide {{ loop.index }}
+            </div>
+          {% endfor %}
+        {% elif file.filetype == 'xlsx' %}
+          {% for sheet_name, rows in file.data.items() %}
+            {% set sheet_text = rows|map('join', ' ')|join(' ') %}
+            <div class="tab {% if search_terms|select('in', sheet_text|lower)|list %}active{% endif %}" 
+                 onclick="showTab('{{ file._id }}', 'sheet-{{ loop.index }}', event)">
+              Sheet {{ sheet_name }}
+            </div>
+          {% endfor %}
+        {% endif %}
+      </div>
+
+      <!-- Tab Contents -->
+      {% macro highlight_text(text, terms) %}
+        {% for term in terms %}
+          {% set text = text|replace(term, '<span class="highlight">' ~ term ~ '</span>', ignorecase=True) %}
+        {% endfor %}
+        {{ text|safe }}
+      {% endmacro %}
+
+      {% if file.filetype == 'pdf' %}
+        {% for page in file.data %}
+          <div id="page-{{ loop.index }}-{{ file._id }}" class="tab-content {% if search_terms|select('in', page.text|lower)|list %}active{% endif %}">
+            <pre>{{ highlight_text(page.text|default(''), search_terms) }}</pre>
+          </div>
+        {% endfor %}
+      {% elif file.filetype == 'pptx' %}
+        {% for slide in file.data %}
+          <div id="slide-{{ loop.index }}-{{ file._id }}" class="tab-content {% if search_terms|select('in', slide.texts|join(' ')|lower)|list %}active{% endif %}">
+            <pre>{{ highlight_text(slide.texts|join(' '), search_terms) }}</pre>
+          </div>
+        {% endfor %}
+      {% elif file.filetype == 'xlsx' %}
+        {% for sheet_name, rows in file.data.items() %}
+          <div id="sheet-{{ loop.index }}-{{ file._id }}" class="tab-content {% if search_terms|select('in', rows|map('join', ' ')|join(' ')|lower)|list %}active{% endif %}">
+            <table>
+              {% for row in rows[:50] %} {# limit rows to 50 for large sheets #}
+                <tr>
+                  {% for cell in row %}
+                    <td>{{ highlight_text(cell|string, search_terms) }}</td>
+                  {% endfor %}
+                </tr>
+              {% endfor %}
+            </table>
+            {% if rows|length > 50 %}
+              <p class="snippet">... preview limited to 50 rows ...</p>
+            {% endif %}
+          </div>
+        {% endfor %}
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
+  <script>
+    function showTab(fileId, tabId, evt) {
+      document.querySelectorAll(`#file-${fileId} .tab-content`).forEach(c => c.classList.remove('active'));
+      document.querySelectorAll(`#file-${fileId} .tab`).forEach(t => t.classList.remove('active'));
+      document.getElementById(tabId + "-" + fileId).classList.add('active');
+      if(evt) evt.currentTarget.classList.add('active');
+    }
+  </script>
+</body>
+</html>

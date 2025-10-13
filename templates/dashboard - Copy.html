@@ -1,0 +1,268 @@
+<!-- templates/index.html - Frontend dashboard adapted for uploaded Excel (with images), PPT, PDF -->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Interactive Dashboard with DataTables and PDF Viewer</title>
+
+  <!-- DataTables CSS -->
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css" />
+
+  <!-- Bootstrap CSS -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
+
+  <style>
+    body {
+      padding: 20px;
+    }
+    .section {
+      margin-bottom: 3rem;
+    }
+    img.sheet-img, img.pdf-img {
+      max-width: 150px;
+      max-height: 150px;
+      margin: 5px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    #ppt-text {
+      white-space: pre-wrap;
+      font-family: monospace;
+      padding: 1rem;
+      background: #f8f9fa;
+      border-radius: 5px;
+      border: 1px solid #ddd;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+  </style>
+</head>
+<body>
+  <h1>Interactive Dashboard</h1>
+
+  <div class="section">
+    <h2>Uploaded Excel Files</h2>
+    <select id="excel-files-select" class="form-select mb-2" aria-label="Select Excel File">
+      <option value="">-- Select File --</option>
+      {% for file in excel_files %}
+      <option value="{{ file.id }}">{{ file.filename }} ({{ file.upload_time.strftime('%Y-%m-%d') }})</option>
+      {% endfor %}
+    </select>
+    <select id="excel-sheets-select" class="form-select mb-2" aria-label="Select Sheet" disabled>
+      <option value="">-- Select Sheet --</option>
+    </select>
+    <div id="excel-sheet-images" class="mb-3"></div>
+    <table id="excel-data-table" class="display" style="width:100%; display:none;">
+      <thead></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="section">
+    <h2>Uploaded PowerPoint Files</h2>
+    <select id="ppt-files-select" class="form-select mb-3" aria-label="Select PPT File">
+      <option value="">-- Select File --</option>
+      {% for file in ppt_files %}
+      <option value="{{ file.id }}">{{ file.filename }} ({{ file.upload_time.strftime('%Y-%m-%d') }})</option>
+      {% endfor %}
+    </select>
+    <div id="ppt-slide-viewer" style="display:none;">
+      <div id="ppt-text"></div>
+      <div class="ppt-slide-nav mt-2">
+        <button id="prev-slide" class="btn btn-primary btn-sm">Previous Slide</button>
+        <button id="next-slide" class="btn btn-primary btn-sm">Next Slide</button>
+        <span id="slide-counter" style="margin-left: 10px;"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Uploaded PDF Files</h2>
+    <select id="pdf-files-select" class="form-select mb-3" aria-label="Select PDF File">
+      <option value="">-- Select File --</option>
+      {% for file in pdf_files %}
+      <option value="{{ file.id }}">{{ file.filename }} ({{ file.upload_time.strftime('%Y-%m-%d') }})</option>
+      {% endfor %}
+    </select>
+    <div id="pdf-page-text" style="white-space: pre-wrap; border: 1px solid #ccc; padding: 10px; max-height: 600px; overflow-y: auto;"></div>
+    <div id="pdf-page-images" class="mt-3"></div>
+  </div>
+
+  <!-- JQuery and DataTables JS -->
+  <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+
+  <script>
+    let excelDataTable;
+    let pptSlides = [];
+    let currentSlideIndex = 0;
+
+    // Uploaded Excel Files
+    $('#excel-files-select').change(function() {
+      const fileId = $(this).val();
+      $('#excel-sheets-select').empty().append('<option value="">-- Select Sheet --</option>').prop('disabled', true);
+      $('#excel-sheet-images').empty();
+      $('#excel-data-table').hide();
+      if (excelDataTable) {
+        excelDataTable.clear().destroy();
+      }
+      if (!fileId) return;
+
+      $.getJSON(`/api/uploaded_excel_sheets/${fileId}`, function(sheets) {
+        if (sheets.length === 0) {
+          alert('No sheets with data found');
+          return;
+        }
+        sheets.forEach(sheet => {
+          $('#excel-sheets-select').append(new Option(sheet, sheet));
+        });
+        $('#excel-sheets-select').prop('disabled', false);
+      });
+    });
+
+    $('#excel-sheets-select').change(function() {
+      const fileId = $('#excel-files-select').val();
+      const sheetName = $(this).val();
+      $('#excel-sheet-images').empty();
+      $('#excel-data-table').hide();
+      if (excelDataTable) {
+        excelDataTable.clear().destroy();
+      }
+      if (!fileId || !sheetName) return;
+
+      $.getJSON('/api/uploaded_excel_sheet_data', { file_id: fileId, sheet_name: sheetName }, function(res) {
+        if (!res.data || res.data.length === 0) {
+          alert('No data found in this sheet');
+          return;
+        }
+        // Render table
+        const headers = res.data[0];
+        const rows = res.data.slice(1);
+        if (excelDataTable) {
+          excelDataTable.clear().destroy();
+        }
+        let theadHtml = '<tr>';
+        headers.forEach(h => theadHtml += `<th>${escapeHtml(h)}</th>`);
+        theadHtml += '</tr>';
+        $('#excel-data-table thead').html(theadHtml);
+        let tbodyHtml = '';
+        rows.forEach(row => {
+          tbodyHtml += '<tr>';
+          headers.forEach((_, i) => {
+            const cell = row[i] !== undefined && row[i] !== null ? row[i] : '';
+            tbodyHtml += `<td>${escapeHtml(cell)}</td>`;
+          });
+          tbodyHtml += '</tr>';
+        });
+        $('#excel-data-table tbody').html(tbodyHtml);
+        $('#excel-data-table').show();
+        excelDataTable = $('#excel-data-table').DataTable({
+          paging: true,
+          searching: true,
+          ordering: true,
+          pageLength: 10,
+          scrollX: true,
+          language: { emptyTable: "No data available" }
+        });
+
+        // Show images
+        if (res.images && res.images.length > 0) {
+          res.images.forEach(b64 => {
+            const img = $(`<img src="data:image/png;base64,${b64}" class="sheet-img" alt="Sheet Image"/>`);
+            $('#excel-sheet-images').append(img);
+          });
+        }
+      });
+    });
+
+    // Uploaded PPT Files
+    $('#ppt-files-select').change(function() {
+      const fileId = $(this).val();
+      pptSlides = [];
+      currentSlideIndex = 0;
+      $('#ppt-text').empty();
+      $('#slide-counter').text('');
+      $('#ppt-slide-viewer').hide();
+      if (!fileId) return;
+
+      $.getJSON(`/api/uploaded_ppt_data/${fileId}`, function(slides) {
+        if (slides.length === 0) {
+          alert('No slides found');
+          return;
+        }
+        pptSlides = slides;
+        $('#ppt-slide-viewer').show();
+        showSlide(currentSlideIndex);
+      });
+    });
+
+    function showSlide(index) {
+      if (index < 0) index = pptSlides.length - 1;
+      if (index >= pptSlides.length) index = 0;
+      currentSlideIndex = index;
+      const slide = pptSlides[index];
+      $('#ppt-text').empty();
+      try {
+        const slideData = JSON.parse(slide.slide_text);
+        $('#ppt-text').text(slideData.text || '');
+        if (slideData.tables && slideData.tables.length > 0) {
+          slideData.tables.forEach(tableData => {
+            const table = $('<table/>').addClass('table table-bordered mt-2');
+            tableData.forEach((row, i) => {
+              const tr = $('<tr/>');
+              row.forEach(cell => {
+                const cellTag = i === 0 ? 'th' : 'td';
+                tr.append($(`<${cellTag}/>`, {text: cell}));
+              });
+              table.append(tr);
+            });
+            $('#ppt-text').append(table);
+          });
+        }
+      } catch {
+        $('#ppt-text').text(slide.slide_text || '[No text]');
+      }
+      $('#slide-counter').text(`Slide ${index + 1} of ${pptSlides.length}`);
+    }
+
+    $('#prev-slide').click(() => showSlide(currentSlideIndex - 1));
+    $('#next-slide').click(() => showSlide(currentSlideIndex + 1));
+
+    // Uploaded PDF Files
+    $('#pdf-files-select').change(function() {
+      const fileId = $(this).val();
+      $('#pdf-page-text').empty();
+      $('#pdf-page-images').empty();
+      if (!fileId) return;
+
+      $.getJSON(`/api/uploaded_pdf_data/${fileId}`, function(pages) {
+        if (pages.length === 0) {
+          $('#pdf-page-text').text('No pages found.');
+          return;
+        }
+        let textContent = '';
+        $('#pdf-page-images').empty();
+        pages.forEach(page => {
+          textContent += `--- Page ${page.page_number} ---\n${page.page_text}\n\n`;
+          if (page.images && page.images.length > 0) {
+            page.images.forEach(b64 => {
+              const img = $(`<img class="pdf-img" alt="PDF Image" src="data:image/png;base64,${b64}"/>`);
+              $('#pdf-page-images').append(img);
+            });
+          }
+        });
+        $('#pdf-page-text').text(textContent);
+      });
+    });
+
+    // Helper to escape HTML
+    function escapeHtml(text) {
+      if (!text) return '';
+      return text.toString().replace(/[&<>"']/g, function(m) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];
+      });
+    }
+  </script>
+</body>
+</html>

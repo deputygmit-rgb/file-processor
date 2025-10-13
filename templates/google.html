@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Interactive Google Sheets Viewer</title>
+  <style>
+    /* (Use the exact CSS provided in the prompt) */
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+      max-width: 100%;
+      height: 40%;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    h1 {
+      margin-bottom: 15px;
+    }
+    #sheet-select {
+      width: 100%;
+      max-width: 100%;
+      padding: 8px;
+      font-size: 1rem;
+      margin-bottom: 10px;
+      box-sizing: border-box;
+    }
+    .loading {
+      display: none;
+      margin-top: 10px;
+      font-style: italic;
+      color: #555;
+    }
+    .error-message {
+      color: #b00020;
+      margin-top: 10px;
+      font-weight: 600;
+    }
+    .tabs {
+      margin-top: 20px;
+      border-top: 1px solid #ccc;
+      padding-top: 10px;
+    }
+    .tab-buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .tab-buttons button {
+      padding: 8px 14px;
+      border: 1px solid #ccc;
+      background: #f9f9f9;
+      cursor: pointer;
+      border-radius: 4px;
+      transition: background-color 0.3s ease;
+      user-select: none;
+    }
+    .tab-buttons button:hover:not(.active) {
+      background-color: #e0e0e0;
+    }
+    .tab-buttons button.active {
+      background-color: #007bff;
+      color: white;
+      border-color: #007bff;
+      font-weight: bold;
+      box-shadow: 0 0 6px rgba(0,123,255,0.5);
+    }
+    .tab-content {
+      margin-top: 15px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      padding: 12px;
+      max-height: 600px;
+      overflow: auto;
+      background: white;
+      box-shadow: 0 2px 6px rgb(0 0 0 / 0.1);
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      font-size: 0.95rem;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 6px 10px;
+      text-align: left;
+    }
+    th {
+      background-color: #f3f3f3;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    @media (max-width: 600px) {
+      .tab-buttons button {
+        flex: 1 1 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <h1>Select a Google Sheet</h1>
+  <button id="import-data-btn">Import All Sheets Data to SQL</button>
+  <div id="import-result" style="margin-top:10px;"></div>
+  
+  <script>
+   document.getElementById('import-data-btn').onclick = () => {
+    const btn = document.getElementById('import-data-btn');
+    const resultDiv = document.getElementById('import-result');
+    btn.disabled = true;
+    resultDiv.textContent = 'Importing data, please wait...';
+
+    fetch('/store_all_data', { method: 'POST' })
+      .then(res => res.json())
+      .then(data => {
+        btn.disabled = false;
+        if(data.error) {
+          resultDiv.textContent = 'Error: ' + data.error;
+        } else {
+          let msg = data.message;
+          if(data.errors && data.errors.length) {
+            msg += '\nWarnings:\n' + data.errors.join('\n');
+          }
+          resultDiv.textContent = msg;
+        }
+      })
+      .catch(err => {
+        btn.disabled = false;
+        resultDiv.textContent = 'Fetch error: ' + err;
+      });
+   };
+  </script>
+  <input type="text" id="search-sheet" placeholder="Search sheets..." aria-label="Search Google Sheets" />
+  
+  <select id="sheet-select" aria-label="Select Google Sheet">
+    <option value="">-- Select a Google Sheet --</option>
+    {% for sheet in sheets %}
+      <option value="{{ extract_sheet_id(sheet.sheet_link) }}">{{ sheet.sheet_name }}</option>
+    {% endfor %}
+  </select>
+
+  <div class="loading" id="loading">Loading tabs and data...</div>
+  <div class="error-message" id="error-message" role="alert"></div>
+
+  <div class="tabs" id="tabs-container" style="display:none;">
+    <div class="tab-buttons" id="tab-buttons" role="tablist"></div>
+    <div class="tab-content" id="tab-content" tabindex="0" role="tabpanel" aria-live="polite"></div>
+  </div>
+
+  <script>
+    const sheetSelect = document.getElementById('sheet-select');
+    const searchInput = document.getElementById('search-sheet');
+    const tabsContainer = document.getElementById('tabs-container');
+    const tabButtonsDiv = document.getElementById('tab-buttons');
+    const tabContentDiv = document.getElementById('tab-content');
+    const loadingIndicator = document.getElementById('loading');
+    const errorMessage = document.getElementById('error-message');
+
+    // Filter dropdown options by search input
+    searchInput.addEventListener('input', () => {
+      const filter = searchInput.value.toLowerCase();
+      for (const option of sheetSelect.options) {
+        const text = option.text.toLowerCase();
+        option.style.display = text.includes(filter) ? '' : 'none';
+      }
+    });
+
+    sheetSelect.addEventListener('change', function() {
+      const sheetId = this.value;
+      errorMessage.textContent = '';
+      if (!sheetId) {
+        tabsContainer.style.display = 'none';
+        tabButtonsDiv.innerHTML = '';
+        tabContentDiv.innerHTML = '';
+        return;
+      }
+
+      loadingIndicator.style.display = 'block';
+      tabsContainer.style.display = 'none';
+      tabButtonsDiv.innerHTML = '';
+      tabContentDiv.innerHTML = '';
+
+      fetch('/get_tabs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sheet_id: sheetId })
+      })
+      .then(res => res.json())
+      .then(data => {
+        loadingIndicator.style.display = 'none';
+        if (data.error) {
+          errorMessage.textContent = data.error;
+          tabsContainer.style.display = 'none';
+          return;
+        }
+
+        const tabs = data.tabs;
+        if (Object.keys(tabs).length === 0) {
+          errorMessage.textContent = 'No data found in any tabs.';
+          tabsContainer.style.display = 'none';
+          return;
+        }
+
+        errorMessage.textContent = '';
+        let first = true;
+        for (const tabName in tabs) {
+          const btn = document.createElement('button');
+          btn.textContent = tabName;
+          btn.setAttribute('role', 'tab');
+          btn.setAttribute('aria-selected', first ? 'true' : 'false');
+          btn.setAttribute('tabindex', first ? '0' : '-1');
+          btn.onclick = () => {
+            setActiveTab(btn);
+            tabContentDiv.innerHTML = createTableHTML(tabs[tabName]);
+            tabContentDiv.focus();
+          };
+          tabButtonsDiv.appendChild(btn);
+          if (first) {
+            btn.classList.add('active');
+            tabContentDiv.innerHTML = createTableHTML(tabs[tabName]);
+            first = false;
+          }
+        }
+
+        tabsContainer.style.display = 'block';
+      })
+      .catch(err => {
+        loadingIndicator.style.display = 'none';
+        errorMessage.textContent = 'Error fetching data: ' + err;
+        tabsContainer.style.display = 'none';
+      });
+    });
+
+    function createTableHTML(data) {
+      let html = '<table><thead><tr>';
+      // Use first row as header if present
+      const headers = data[0] || [];
+      for (let h of headers) {
+        html += `<th>${escapeHtml(h)}</th>`;
+      }
+      html += '</tr></thead><tbody>';
+      for (let i = 1; i < data.length; i++) {
+        const row = data[i];
+        html += '<tr>';
+        for (let cell of row) {
+          html += `<td>${escapeHtml(cell)}</td>`;
+        }
+        html += '</tr>';
+      }
+      html += '</tbody></table>';
+      return html;
+    }
+
+    function setActiveTab(button) {
+      const btns = tabButtonsDiv.querySelectorAll('button');
+      btns.forEach(b => {
+        b.classList.remove('active');
+        b.setAttribute('aria-selected', 'false');
+        b.setAttribute('tabindex', '-1');
+      });
+      button.classList.add('active');
+      button.setAttribute('aria-selected', 'true');
+      button.setAttribute('tabindex', '0');
+    }
+
+    // Simple escape to prevent HTML injection
+    function escapeHtml(text) {
+      if (!text) return '';
+      return text.toString().replace(/[&<>"']/g, function(m) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];
+      });
+    }
+  </script>
+</body>
+</html>
