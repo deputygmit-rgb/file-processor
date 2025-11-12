@@ -81,6 +81,7 @@
                 <div><b>Score:</b> {{ file.score|default(0.0)|float|round(3) }}</div>
                 {% if file.boost is defined %}
                   <div class="text-primary small">+ Boost: {{ file.boost|float|round(2) }}</div>
+                  <div class="text-primary small">+ KG Boost: {{ file.kg_boost|float|round(2) }}</div>
                 {% endif %}
               </div>
             </div>

@@ -12,6 +12,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 import fitz  # PyMuPDF
 import pdfplumber
 import pytesseract
+from bs4 import BeautifulSoup
 from pymongo import MongoClient
 from gridfs import GridFS, NoFile
 from bson import ObjectId
@@ -20,6 +21,8 @@ import html
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import nltk, re
+import openai
+import time
 from nltk.stem import PorterStemmer
 from nltk.corpus import wordnet
 import faiss, json
@@ -48,15 +51,23 @@ from flask import Flask, send_file, flash, redirect, url_for
 from bson import ObjectId
 from flask import abort
 from flask import Flask, request, render_template, jsonify
-from transformers import pipeline
 from keybert import KeyBERT
 import math, re
-
+from itertools import combinations
+import onnxruntime as ort
+import numpy as np
+from sentence_transformers import CrossEncoder, InputExample
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+from transformers import AutoTokenizer, AutoModel
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from peft import PeftModel
 app = Flask(__name__)
 
 # 🧠 Load summarization + analysis models (load once)
-summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6", device_map="auto")
-ner_analyzer = pipeline("ner", grouped_entities=True, model="dslim/bert-base-NER", device_map="auto")
+summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6", device_map=None)
+ner_analyzer = pipeline("ner", grouped_entities=True, model="dslim/bert-base-NER", device_map=None)
 kw_model = KeyBERT()
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 # --------------------------- Configuration & App --------------------------------
@@ -82,14 +93,50 @@ index_lock = threading.Lock()
 
 # Mongo
 mongo = PyMongo(app)
-client = MongoClient(app.config["MONGO_URI"])
-db = client.get_default_database()
-fs = GridFS(db)
+# Initialize MongoDB client with a short server selection timeout so failures are
+# detected quickly during startup. If connection to the configured MongoDB
+# instance fails, fall back to an in-memory mongomock instance for local
+# development (if mongomock is installed). This avoids the app blocking on
+# startup when MongoDB is not available.
+try:
+    client = MongoClient(app.config["MONGO_URI"], serverSelectionTimeoutMS=5000)
+    # Force a server selection / ping to verify connectivity
+    client.admin.command('ping')
+    db = client.get_default_database()
+    fs = GridFS(db)
+    app.logger.info("Connected to MongoDB at %s", app.config.get("MONGO_URI"))
+except Exception as _mongo_err:
+    app.logger.warning("MongoDB connection failed: %s", _mongo_err)
+    # Attempt to fall back to mongomock for development convenience
+    try:
+        import mongomock
+        client = mongomock.MongoClient()
+        # mongomock doesn't support get_default_database well; use configured DB name
+        db_name = None
+        try:
+            # parse DB name from URI if possible
+            from urllib.parse import urlparse
+            parsed = urlparse(app.config.get("MONGO_URI", ""))
+            # For URIs like mongodb://host:port/dbname
+            if parsed.path and len(parsed.path) > 1:
+                db_name = parsed.path.lstrip('/')
+        except Exception:
+            db_name = None
+        if not db_name:
+            db_name = 'dashboard_db'
+        db = client[db_name]
+        fs = GridFS(db)
+        app.logger.info("Using mongomock in-memory MongoDB (db=%s)", db_name)
+    except Exception as _mm_err:
+        app.logger.error("mongomock fallback not available: %s. DB features will be disabled.", _mm_err)
+        client = None
+        db = None
+        fs = None
 
-ALLOWED_EXTENSIONS = {"xlsx", "pptx", "pdf", "png", "jpg", "jpeg", "bmp", "gif", "tiff"}
+ALLOWED_EXTENSIONS = {"xlsx", "pptx", "pdf", "html", "htm", "png", "jpg", "jpeg", "bmp", "gif", "tiff"}
 
 
-driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "Call2@007"))
+driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "Pankaj1234"))
 # --- Test Neo4j connection on startup ---
 try:
     with driver.session() as session:
@@ -98,9 +145,75 @@ try:
 except Exception as e:
     print("❌ Neo4j connection failed:", e)
 
-db = client["railwaydb"]  # use your DB name
-files_collection = db["files"]  # common collection for all uploads
-kg_collection = db["knowledge_graph"]  # <-- Add this line
+
+# --- Helper: timed Neo4j runner to log slow queries ---
+SLOW_KG_MS = int(os.getenv("SLOW_KG_MS", "200"))
+def timed_run(session, cypher, **params):
+    """Run a cypher query and log if it takes longer than SLOW_KG_MS milliseconds."""
+    t0 = time.time()
+    res = session.run(cypher, **params)
+    dur = (time.time() - t0) * 1000.0
+    if dur > SLOW_KG_MS:
+        try:
+            app.logger.warning("Slow KG query: %.1fms — query head: %s", dur, cypher[:300])
+        except Exception:
+            app.logger.warning("Slow KG query: %.1fms", dur)
+    return res
+
+
+# --- Simple in-memory TTL LRU cache for KG results ---
+from collections import OrderedDict
+
+KG_CACHE_MAX = int(os.getenv("KG_CACHE_MAX", "1024"))
+KG_CACHE_TTL = int(os.getenv("KG_CACHE_TTL", "3600"))  # seconds
+
+def _cache_get(cache, key):
+    now = time.time()
+    item = cache.get(key)
+    if not item:
+        return None
+    value, ts = item
+    if now - ts > KG_CACHE_TTL:
+        try:
+            del cache[key]
+        except KeyError:
+            pass
+        return None
+    # move to end (recently used)
+    try:
+        cache.move_to_end(key)
+    except Exception:
+        pass
+    return value
+
+def _cache_set(cache, key, value):
+    now = time.time()
+    cache[key] = (value, now)
+    try:
+        cache.move_to_end(key)
+    except Exception:
+        pass
+    # evict oldest if necessary
+    while len(cache) > KG_CACHE_MAX:
+        try:
+            cache.popitem(last=False)
+        except Exception:
+            break
+
+# caches
+KG_EXPAND_CACHE = OrderedDict()
+KG_IMPORTANCE_CACHE = OrderedDict()
+KG_RELATED_FAILURES_CACHE = OrderedDict()
+
+if client is not None:
+    db = client["railwaydb"]  # use your DB name
+    files_collection = db["files"]  # common collection for all uploads
+    kg_collection = db["knowledge_graph"]  # <-- Add this line
+else:
+    db = None
+    files_collection = None
+    kg_collection = None
+    app.logger.warning("No MongoDB client available — DB-backed features will be disabled.")
 _illegal_xml_re = re.compile(r'[\x00-\x08\x0b-\x0c\x0e-\x1f]')
 ps = PorterStemmer()
 
@@ -116,6 +229,7 @@ model = SentenceTransformer("all-MiniLM-L6-v2")
 nlp = spacy.load("en_core_web_sm")
 nlp.max_length = 3_000_000  # increase to comfortably handle your largest tex
 matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
+global SIGNAL_ASSETS, RAIL_FAILURE_DICT, RAILWAY_ASSETS
 rail_terms = [
     # Core entities
     "railway board", "railway zone", "railway division", "railway department",
@@ -148,17 +262,97 @@ rail_terms = [
     "northeast frontier railway", "south central railway", "south coast railway",
     "konkan railway", "east central railway", "south east central railway",
     "north western railway", "east coast railway", "north central railway",
-    "south western railway", "west central railway",
+    "south western railway", "west central railway","NR","SR","ER","WR","CR","NER","SER","NFR","SCR","ECR","SECR","NWR","ECoR","NCR","SWR","WCR",
 
     # Major Divisions (partial list; can be extended dynamically)
     "delhi division", "mumbai division", "chennai division", "howrah division",
     "secunderabad division", "bilaspur division", "bhopal division", "hubballi division",
     "jaipur division", "nagpur division", "lucknow division", "guwahati division",
-    "vadodara division", "madurai division", "raipur division", "ratlam division",
-    "sambalpur division", "tiruchirappalli division"
+    "vadodara division", "madurai division", "raipur division", "ratlam division", "Raipur division"
+    "sambalpur division", "tiruchirappalli division", "vijayawada division", "visakhapatnam division","BSP","BPL","UBL","UBL","JPR","NGP","LKO","GHY","BRC","MDU","R","RTM","SBP","TIR","BZA","VSKP","NAG","NGP"
 ]
+# Asset list for all Indian Railway departments
+railway_assets = {
+    "civil engineering": [
+        # Track infrastructure
+        "rail tracks", "sleepers", "ballast", "turnouts", "points and crossings",
+        "track joints", "fishplates", "track fastenings", "rails", "switch expansion joints",
+        # Structures
+        "bridges", "culverts", "retaining walls", "tunnels", "buildings",
+        "platforms", "foot over bridges", "subways", "station buildings",
+        "drainage systems", "embankments", "cuttings",
+        # Water & environment
+        "water supply systems", "sewage systems", "rainwater harvesting", "drinking water points",
+        # Equipment
+        "earthwork machinery", "survey equipment", "welding machines", "tamping machines"
+    ],
+
+    "signal and telecommunication": [
+        # Signalling Equipment
+        "signal relays", "axle counters", "interlocking panels", "route indicators",
+        "signal posts", "led signal units", "signal transformers",
+        "control panels", "signal relays", "neutral sections", "track circuits",
+        "block instruments", "lever frames", "route setting panels", "panel interlocking",
+        "electronic interlocking", "solid state interlocking",
+        # Communication
+        "telephones", "optical fiber cables", "vhf sets", "microwave towers", "exchange systems",
+        "control communication equipment", "train radio system",
+        # Power & control
+        "power supply panels", "batteries", "charger units", "dc distribution boards"
+    ],
+
+    "mechanical": [
+        # Rolling stock
+        "locomotives", "diesel locomotives", "electric locomotives", "coaches", "wagons",
+        "brake vans", "cranes", "tower cars",
+        # Components
+        "bogies", "axle boxes", "brake systems", "air brake system", "couplers",
+        "draw gear", "traction motors", "compressors", "wheel sets", "bearing housings",
+        # Maintenance
+        "pit lines", "wash plants", "lifting jacks", "underframe equipment",
+        "lubrication systems", "fuel pumps", "sanders"
+    ],
+
+    "electrical": [
+        # Traction Power
+        "traction transformers", "overhead equipment", "section insulators",
+        "neutral sections", "contact wire", "dropper wire", "catenary wire",
+        "traction substations", "feeders", "circuit breakers",
+        # Non-traction Power
+        "lighting systems", "switchgear", "earthing systems", "distribution panels",
+        "batteries", "inverters", "ups systems", "generators",
+        # Signalling & general services
+        "station lighting", "lift systems", "fans", "air conditioning units"
+    ],
+
+    "stores": [
+        # Inventory & supply
+        "spare parts", "fasteners", "oils", "lubricants", "tools", "consumables",
+        "electrical spares", "signalling spares", "mechanical spares",
+        "track fittings", "relays", "bearings", "paint", "rubber components"
+    ],
+
+    "commercial": [
+        # Passenger & freight operations
+        "ticketing systems", "booking counters", "reservation systems",
+        "automatic ticket vending machines", "freight booking terminals",
+        "display boards", "train indication systems", "enquiry systems",
+        "luggage scanners", "announcement systems", "passenger information displays"
+    ],
+
+    "security": [
+        "surveillance cameras", "cctv systems", "baggage scanners",
+        "access control systems", "door frame metal detectors",
+        "hand held detectors", "public address systems", "fire alarm panels",
+        "security control rooms", "video recorders"
+    ]
+}
 signal_assets = {
     "Panel Interlocking": {"category": "Signalling System", "unit": "Stations"},
+    "Point Machine": {"category": "Signalling System", "unit": "Nos"},
+    "Axle counter": {"category": "Train Detection", "unit": "Nos"},
+    "MSDAC": {"category": "Train Detection", "unit": "Stations"},
+    "Signal Signals": {"category": "Signalling System", "unit": "Stations"},
     "Electronic Interlocking": {"category": "Signalling System", "unit": "Stations"},
     "Route Relay Interlocking": {"category": "Signalling System", "unit": "Stations"},
     "LED Lit Signals": {"category": "Signal Equipment", "unit": "Stations"},
@@ -167,9 +361,13 @@ signal_assets = {
     "Block Proving by Axle Counter": {"category": "Train Detection", "unit": "Block Sections"},
     "Track Circuiting": {"category": "Train Detection", "unit": "Stations"},
     "Automatic Block Signalling": {"category": "Train Control", "unit": "Rkm"},
-    "Intermediate Block Signall"
-    "ing": {"category": "Train Control", "unit": "Nos"},
+    "Intermediate Block Signalling": {"category": "Train Control", "unit": "Nos"},
     "Interlocked Level Crossing": {"category": "Safety Infrastructure", "unit": "Nos"},
+    "ADVANCED STARTER": {"category": "Safety Infrastructure", "unit": "Nos"},
+    "GATE SIGNAL": {"category": "Safety Infrastructure", "unit": "Nos"},
+    "HOME SIGNAL": {"category": "Safety Infrastructure", "unit": "Nos"},
+    "INTERMEDIATE BLOCK SIGNAL": {"category": "Safety Infrastructure", "unit": "Nos"},
+    "BLOCK INSTRUMENT": {"category": "Safety Infrastructure", "unit": "Nos"},
     "Kavach": {"category": "Train Protection", "unit": "Rkm"}
 }
 rail_failure_dict = [
@@ -255,6 +453,46 @@ def load_faiss_index():
 # initial load
 load_faiss_index()
 
+# kg_neo4j_helpers.py
+def asset_exists(tx, asset_name):
+    result = tx.run("MATCH (a:Asset {name:$name}) RETURN count(a) > 0 AS exists", name=asset_name)
+    return result.single()["exists"]
+
+def failure_exists(tx, failure_code):
+    result = tx.run("MATCH (f:Failure {code:$code}) RETURN count(f) > 0 AS exists", code=failure_code)
+    return result.single()["exists"]
+
+def link_failure_to_existing_nodes(tx, failure, file_id):
+    """
+    Create or link failure to *existing* hierarchy nodes.
+    If nodes exist (Zone, Division, Section, Station, Gear), reuse them.
+    """
+    q = """
+    // Match existing hierarchy
+    MATCH (z:Zone {name:$zone})
+    OPTIONAL MATCH (d:Division {name:$division})-[:PART_OF]->(z)
+    OPTIONAL MATCH (s:Section {name:$section})-[:PART_OF]->(d)
+    OPTIONAL MATCH (st:Station {code:$station_code})-[:HAS_STATION]->(s)
+    OPTIONAL MATCH (g:Gear {name:$gear_name})-[:HAS_GEAR]->(st)
+
+    // If missing, create them
+    WITH z, COALESCE(d, MERGE (dnew:Division {name:$division}) MERGE (dnew)-[:PART_OF]->(z) RETURN dnew) AS div,
+         COALESCE(s, MERGE (snew:Section {name:$section}) MERGE (snew)-[:PART_OF]->(div) RETURN snew) AS sec,
+         COALESCE(st, MERGE (stnew:Station {code:$station_code}) MERGE (stnew)-[:HAS_STATION]->(sec) RETURN stnew) AS stn,
+         COALESCE(g, MERGE (gnew:Gear {name:$gear_name, subtype:$gear_subtype}) MERGE (stn)-[:HAS_GEAR]->(gnew) RETURN gnew) AS gear
+
+    // Create or link failure
+    MERGE (f:Failure {failure_entry_no:$failure_entry_no})
+    SET f.department=$department,
+        f.cause=$cause,
+        f.rectification_status=$rectification_status,
+        f.rectification_by=$rectification_by,
+        f.failure_duration=$failure_duration,
+        f.upload_source=$file_id
+
+    MERGE (gear)-[:HAS_FAILURE]->(f)
+    """
+    tx.run(q, **failure, file_id=str(file_id))
 
 def create_kg(tx, rail_failure_dict):
     # Create Departments and AssetGroups first
@@ -279,7 +517,59 @@ def create_kg(tx, rail_failure_dict):
             MERGE (ag)-[:HAS_FAILURE]->(f)
             MERGE (f)-[:BELONGS_TO]->(:Department {name: $department})
         """, failure_code=failure_code, failure_desc=failure_desc, asset_group=asset_group, department=department)
+# kg_bootstrap.py
+from neo4j import GraphDatabase
+# in background_tasks()
+
+def map_to_existing_entities(failure):
+    """
+    Align Excel row to known KG entities to avoid duplicates.
+    """
+    # normalize names
+    failure["zone"] = failure["zone"].upper().strip()
+    failure["division"] = failure["division"].title().strip()
+
+    # normalize department
+    if "tele" in failure.get("department", "").lower():
+        failure["department"] = "S&T"
+
+    # map gear using dictionary
+    for group, items in signal_assets.items():
+        for asset in items.keys():
+            if asset.lower() in failure["gear_name"].lower():
+                failure["gear_group"] = group
+                failure["gear_name"] = asset
+                break
+    return failure
+
+def preload_static_entities(driver):
+    """
+    Create static entity hierarchy (Zones, Divisions, Departments, Asset Groups)
+    once and cache their IDs.
+    """
+    with driver.session() as session:
+        # Example Zone-Division structure
+        for zone, divs in railway_assets.items():
+            session.run("MERGE (z:Zone {name:$zone})", zone=zone)
+            for division in divs:
+                session.run("""
+                    MERGE (d:Division {name:$division})
+                    MERGE (d)-[:PART_OF]->(z)
+                """, zone=zone, division=division)
+
+        # Departments
+        for dept in ["S&T", "Engineering", "Electrical", "Mechanical"]:
+            session.run("MERGE (:Department {name:$dept})", dept=dept)
+
+        # Asset types
+        for asset_type, assets in signal_assets.items():
+            for asset_name in assets.keys():
+                session.run("""
+                    MERGE (a:AssetGroup {name:$asset_name, type:$asset_type})
+                """, asset_name=asset_name, asset_type=asset_type)
+
 with driver.session() as session:
+    preload_static_entities(driver)
     session.execute_write(create_kg, rail_failure_dict)
 
 def add_failures_to_graph(failures):
@@ -289,9 +579,63 @@ def add_failures_to_graph(failures):
     failures: List of dicts with keys:
         department, asset_type, failure_code, failure_subcode, failure_desc, valid, user_asset_failure, system_auto, asset_group
     """
+    if not failures:
+        return 0
+
+    # Prepare rows for UNWIND batch merge
+    rows = []
+    for f in failures:
+        rows.append({
+            "department": f.get("department", ""),
+            "asset_type": f.get("asset_type", ""),
+            "failure_code": f.get("failure_code", ""),
+            "failure_subcode": f.get("failure_subcode", f.get("failure_sub_code", "")),
+            "failure_desc": f.get("failure_desc", f.get("failure_description", "")),
+            "valid": f.get("valid", "Y"),
+            "user_asset_failure": f.get("user_asset_failure", ""),
+            "system_auto": f.get("system_auto", ""),
+            "asset_group": f.get("asset_group", ""),
+        })
+
+    q = """
+    UNWIND $rows AS f
+    MERGE (d:Department {name: f.department})
+    MERGE (a:AssetType {name: f.asset_type})
+    MERGE (d)-[:HAS_ASSET]->(a)
+    MERGE (fc:FailureCode {code: f.failure_code})
+    SET fc.subcode = f.failure_subcode,
+        fc.description = f.failure_desc,
+        fc.valid = f.valid,
+        fc.user_asset_failure = f.user_asset_failure,
+        fc.system_auto = f.system_auto,
+        fc.asset_group = f.asset_group
+    MERGE (a)-[:HAS_FAILURE]->(fc)
+    RETURN count(DISTINCT fc) AS created
+    """
+
     with driver.session() as session:
-        for f in failures:
-            session.execute_write(_create_failure_nodes, f)
+        try:
+            res = timed_run(session, q, rows=rows)
+            created = 0
+            try:
+                r = res.single()
+                created = int(r["created"]) if r and r["created"] is not None else 0
+            except Exception:
+                created = 0
+            app.logger.info("Batch inserted/merged %d failure nodes into KG.", created)
+            return created
+        except Exception as e:
+            app.logger.exception("Failed to batch insert failures into KG: %s", e)
+            # Fallback: try per-item to surface specific bad rows
+            created = 0
+            for f in failures:
+                try:
+                    with driver.session() as session:
+                        session.execute_write(_create_failure_nodes, f)
+                        created += 1
+                except Exception as ex:
+                    app.logger.exception("Failed to create failure node for %s: %s", f.get('failure_code'), ex)
+            return created
 
 def _create_failure_nodes(tx, f):
     # Merge Department node
@@ -612,119 +956,74 @@ def preprocess_image_for_ocr(image_bytes):
 
 
 def clean_extracted_text(text):
-    # Remove (cid:####) patterns
+    if not text:
+        return ""
+
+    # 1) Remove (cid:####) patterns and illegal xml/control chars
     text = re.sub(r'\(cid:\d+\)', '', text)
-    
-    # Collapse tripled/doubled characters like "RReegguullaarr" → "Regular"
-    text = re.sub(r'([A-Za-z])\1{1,}', r'\1', text)
-    
-    # Remove multiple spaces / line breaks
+    text = _illegal_xml_re.sub('', text)
+
+    # 2) Normalize whitespace
     text = re.sub(r'\s+', ' ', text).strip()
-    
-    # Remove repeating words (basic heuristic)
+
+    # Helper: decide if token is likely to be a real word (very permissive)
+    def likely_word(tok: str) -> bool:
+        tok = tok.strip("\'\"()[]{}:;,.!?-_")
+        if not tok:
+            return False
+        # numbers, short tokens and tokens with vowels are likely legitimate
+        if len(tok) <= 3:
+            return True
+        if re.search(r'[aeiouAEIOU]', tok):
+            return True
+        # contains letters and digits mix (e.g., model numbers) — keep
+        if re.search(r'[A-Za-z]', tok) and re.search(r'\d', tok):
+            return True
+        return False
+
+    # 3) Fix common OCR artifacts conservatively
     words = text.split()
     cleaned_words = []
     for w in words:
-        if not cleaned_words or w.lower() != cleaned_words[-1].lower():
+        orig = w
+        # Trim long runs of same character: keep at most two repeats for readability
+        w = re.sub(r'(.)\1{2,}', r'\1\1', w)
+
+        # If token is composed of repeated double-letters (e.g. RReegguulll), collapse pairs
+        if len(w) >= 6:
+            # check if many consecutive pairs are identical (indicative of doubled characters)
+            pairs = [w[i:i+2] for i in range(0, len(w)//2*2, 2)]
+            double_pairs = sum(1 for p in pairs if len(p) == 2 and p[0].lower() == p[1].lower())
+            if double_pairs >= max(2, len(pairs)//2):
+                # collapse each pair to single char
+                try:
+                    w = ''.join(p[0] for p in pairs) + (w[len(pairs)*2:] if len(w) % 2 else '')
+                except Exception:
+                    pass
+
+        # Remove repeated punctuation beyond 3 occurrences
+        w = re.sub(r'([!?.\-_,;:\\"\'\(\)])\1{2,}', r'\1\1', w)
+
+        # Trim extremely long garbage-like tokens but keep most of content
+        if len(w) > 500:
+            # keep head and tail
+            w = w[:250] + '...' + w[-250:]
+
+        # If cleaned token looks much worse (unlikely word) fall back to original to avoid loss
+        if likely_word(orig) or likely_word(w):
             cleaned_words.append(w)
-    text = " ".join(cleaned_words)
-    
-    return text
+        else:
+            # keep original conservative fallback
+            cleaned_words.append(orig)
 
-def extract_relations(text):
-    doc = nlp(text)
-    triples = []
-    for sent in doc.sents:
-        subj = None
-        obj = None
-        verb = None
-        for token in sent:
-            if "subj" in token.dep_:
-                subj = token.text
-            if "obj" in token.dep_:
-                obj = token.text
-            if token.pos_ == "VERB":
-                verb = token.lemma_
-        if subj and verb and obj:
-            triples.append((subj, verb, obj))
-    return triples
+    # 4) Remove immediate duplicate consecutive words (e.g., "the the")
+    final_words = []
+    for w in cleaned_words:
+        if not final_words or w.lower() != final_words[-1].lower():
+            final_words.append(w)
 
-
-def create_entity_node(tx, entity, file_id):
-    """
-    entity = {"text": "BLOCK AXLE COUNTER", "label": "FAILURE"}
-    file_id = MongoDB file ID
-    """
-    # Store primitive properties only
-    print(f"Creating entity node: {entity} for file_id: {file_id}")
-    text = entity.get("text", "").strip()
-    label = entity.get("label", "UNKNOWN").strip()
-    if not text:
-        return  # skip empty entities
-
-    tx.run("""
-        MERGE (e:Entity {text: $text, label: $label})
-        MERGE (e)-[:MENTIONED_IN]->(f:File {id: $file_id})
-    """, text=text, label=label, file_id=str(file_id))
-
-
-def create_relation_node(tx, relation, file_id):
-    """
-    relation = {"from": "BLOCK AXLE COUNTER", "to": "SIGNAL PANEL", "type": "RELATED_TO"}
-    """
-    print(f"Creating relation node: {relation} for file_id: {file_id}")
-    from_text = relation.get("from", "").strip()
-    to_text = relation.get("to", "").strip()
-    rel_type = relation.get("type", "RELATED_TO").strip()
-
-    if not from_text or not to_text:
-        print("⚠️ Skipping relation with missing endpoints:", relation)
-        return
-
-    # SAFEST approach: use APOC with dynamic rel type, via 'apoc.do.when' fallback
-    cypher = """
-    MERGE (a:Entity {text: $from_text})
-    MERGE (b:Entity {text: $to_text})
-    CALL apoc.create.relationship(a, $rel_type, {}, b) YIELD rel
-    MERGE (a)-[:MENTIONED_IN]->(f:File {id: $file_id})
-    MERGE (b)-[:MENTIONED_IN]->(f)
-    RETURN rel
-    """
-
-    try:
-        tx.run(cypher, from_text=from_text, to_text=to_text, rel_type=rel_type, file_id=str(file_id))
-    except Exception as e:
-        print(f"❌ Neo4j error while creating relation {relation}: {e}")
-
-
-def add_to_graph(entities, relations, file_id):
-    print("🧠 Starting KG extraction for uploaded JSON...")
-
-    with driver.session() as session:
-        # --- Add entities ---
-        for e in entities:
-            session.execute_write(create_entity_node, e, file_id)
-
-        # --- Add relations ---
-        for r in relations:
-            # Normalize all possible shapes into standard format
-            if isinstance(r, tuple) and len(r) == 3:
-                r = {"from": r[0], "type": r[1], "to": r[2]}
-            elif isinstance(r, dict):
-                if "head" in r and "relation" in r and "tail" in r:
-                    r = {"from": r["head"], "type": r["relation"], "to": r["tail"]}
-                elif not all(k in r for k in ("from", "to")):
-                    print(f"⚠️ Skipping malformed relation: {r}")
-                    continue
-            else:
-                print(f"⚠️ Skipping invalid relation format: {r}")
-                continue
-
-            print("🔗 Normalized relation:", r)
-            session.execute_write(create_relation_node, r, file_id)
-      
-
-
+    return ' '.join(final_words)
+   
 def process_pdf(file_stream):
     file_stream.seek(0)
     file_bytes = file_stream.read()
@@ -796,6 +1095,95 @@ def process_image(file_stream, filename):
     data = {"images": [{"id": str(image_id), "ext": image_ext}], "ocr_text": text}
     return data
 
+
+def process_html(file_stream, filename=None):
+    """Parse HTML, extract formatted text, headings and tables.
+    Returns a dict containing: title, headings, paragraphs, lists, tables, images, full_html
+    """
+    file_stream.seek(0)
+    raw = file_stream.read()
+    try:
+        text = raw.decode("utf-8")
+    except Exception:
+        text = raw.decode("utf-8", errors="replace")
+
+    soup = BeautifulSoup(text, "html.parser")
+
+    title = soup.title.string.strip() if soup.title and soup.title.string else ""
+
+    headings = []
+    for lvl in range(1, 7):
+        for h in soup.find_all(f"h{lvl}"):
+            headings.append(clean_extracted_text(h.get_text(" ", strip=True)))
+
+    paragraphs = [clean_extracted_text(p.get_text(" ", strip=True)) for p in soup.find_all("p")]
+
+    lists = []
+    for ul in soup.find_all(["ul", "ol"]):
+        items = [clean_extracted_text(li.get_text(" ", strip=True)) for li in ul.find_all("li")]
+        if items:
+            lists.append(items)
+
+    # Tables: preserve both structure and HTML fragment for formatting
+    tables = []
+    for t_idx, table in enumerate(soup.find_all("table")):
+        rows = []
+        for tr in table.find_all("tr"):
+            cells = [clean_extracted_text(td.get_text(" ", strip=True)) for td in tr.find_all(["th", "td"])]
+            if cells:
+                rows.append(cells)
+        table_html = str(table)
+        # attempt to infer headers
+        headers = []
+        if rows:
+            first_row = rows[0]
+            # heuristic: if first row contains non-empty values and likely header
+            headers = first_row
+            data_rows = rows[1:]
+        else:
+            data_rows = []
+
+        tables.append({
+            "table_index": t_idx,
+            "headers": headers,
+            "rows": data_rows,
+            "html": table_html,
+        })
+
+    # Images: handle data URIs by storing in GridFS, otherwise keep src
+    images = []
+    for img_idx, img in enumerate(soup.find_all("img"), start=1):
+        src = img.get("src") or ""
+        if src.startswith("data:"):
+            try:
+                header, b64 = src.split(",", 1)
+                import base64 as _b64
+                img_bytes = _b64.b64decode(b64)
+                # try to infer extension
+                mtype = header.split(";")[0].split(":")[1] if ":" in header else "image/png"
+                ext = mtype.split("/")[-1]
+                img_id = fs.put(img_bytes, contentType=mtype, filename=(filename or "uploaded") + f"_img_{img_idx}.{ext}")
+                images.append({"id": str(img_id), "ext": ext})
+            except Exception as e:
+                app.logger.debug("Failed to store data URI image: %s", e)
+                images.append({"src": src})
+        else:
+            images.append({"src": src})
+
+    # full HTML (sanitized lightly)
+    full_html = str(soup)
+
+    data = {
+        "title": title,
+        "headings": headings,
+        "paragraphs": paragraphs,
+        "lists": lists,
+        "tables": tables,
+        "images": images,
+        "full_html": full_html,
+    }
+    return data
+
 def clean_for_mongo(obj):
     if obj is None:
         return None
@@ -845,6 +1233,9 @@ def process_and_store_file(abs_path):
         file_data = process_pdf(io.BytesIO(file_bytes))
     elif filetype in {"png", "jpg", "jpeg", "bmp", "gif", "tiff"}:
         file_data = process_image(io.BytesIO(file_bytes), filename)
+    elif filetype in {"html", "htm"}:
+        # process HTML and preserve simple formatting and tables
+        file_data = process_html(io.BytesIO(file_bytes))
     else:
         raise ValueError("Unsupported file type")
 
@@ -880,15 +1271,6 @@ def process_and_store_file(abs_path):
 
     return inserted.inserted_id, filename
 
-def extract_entities(text, chunk_size=100_000):
-    entities = []
-    n = len(text)
-    for i in range(0, n, chunk_size):
-        chunk = text[i:i+chunk_size]
-        doc = nlp(chunk)
-        for ent in doc.ents:
-            entities.append({"text": ent.text, "label": ent.label_})
-    return entities
 
 
 def process_and_store_file_with_check(abs_path):
@@ -916,22 +1298,6 @@ def process_and_store_file_with_check(abs_path):
 
     return inserted_id, stored_filename
 
-def extract_signal_assets(text):
-    assets = []
-    for name in signal_assets.keys():
-        pattern = rf"{re.escape(name)}.*?(\d[\d,]*)"
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            count = int(match.group(1).replace(",", ""))
-            assets.append({
-                "asset_name": name,
-                "count": count,
-                "category": signal_assets[name]["category"],
-                "unit": signal_assets[name]["unit"],
-                "as_on": "2025-08-31"
-            })
-    return assets
-
 
 def check_duplicate_and_save(file, files_collection, extra_metadata=None):
     """
@@ -944,7 +1310,7 @@ def check_duplicate_and_save(file, files_collection, extra_metadata=None):
     # Look for existing entry
     existing = files_collection.find_one({"file_hash": file_hash})
     if existing:
-        return "duplicate", existing
+        existing = files_collection.find_one({"file_hash": file_hash})
 
     # Insert new document metadata
     new_doc = {
@@ -960,26 +1326,21 @@ def check_duplicate_and_save(file, files_collection, extra_metadata=None):
     new_doc["_id"] = inserted_id
     return "new", new_doc
 
-def add_assets_to_graph(assets, department, directorate):
-    with driver.session() as session:
-        for a in assets:
-            session.run("""
-                MERGE (dept:Department {name: $dept})
-                MERGE (dir:Directorate {name: $dir})
-                MERGE (dept)-[:HAS_DIRECTORATE]->(dir)
-                MERGE (asset:Asset {name: $name})
-                SET asset.count = $count, asset.unit = $unit, asset.as_on = $as_on
-                MERGE (dir)-[:MAINTAINS]->(asset)
-            """, {
-                "dept": department,
-                "dir": directorate,
-                "name": a["asset_name"],
-                "count": a["count"],
-                "unit": a["unit"],
-                "as_on": a["as_on"]
+
+def extract_entities(text, chunk_size=100_000):
+    entities = []
+    n = len(text)
+    for i in range(0, n, chunk_size):
+        chunk = text[i:i+chunk_size]
+        doc = nlp(chunk)
+        for ent in doc.ents:
+            label, meta = classify_rail_entity(ent.text)
+            entities.append({
+                "text": ent.text,
+                "label": label,
+                "meta": meta
             })
-
-
+    return entities
 
 def extract_failure_codes(file_data):
     """
@@ -1050,6 +1411,103 @@ def extract_failure_codes(file_data):
             failures.append(failure)
 
     return failures
+from rapidfuzz import fuzz, process
+import numpy as np
+
+# Optional: use your existing sentence embedding model (if available)
+try:
+    from sentence_transformers import SentenceTransformer
+    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+    USE_EMBEDDING_SIM = True
+except Exception:
+    USE_EMBEDDING_SIM = False
+
+
+def semantic_similarity(a, b):
+    """Compute cosine similarity between two strings using embeddings."""
+    if not USE_EMBEDDING_SIM:
+        return 0.0
+    emb_a = embed_model.encode(a, normalize_embeddings=True)
+    emb_b = embed_model.encode(b, normalize_embeddings=True)
+    return float(np.dot(emb_a, emb_b))
+
+
+def classify_rail_entity(text,
+                         fuzzy_threshold=85, embed_threshold=0.75, use_embedding_sim=True):
+    """
+    Classify text into railway-related semantic categories using fuzzy and semantic similarity.
+    Returns (category, metadata).
+    """
+    t = text.lower().strip()
+    best_match, best_score, category_meta = None, 0, {}
+    
+    # Helper for fuzzy + semantic similarity
+    def match_score(source, candidates):
+        """Return the best fuzzy+semantic match for a text source."""
+        if not candidates:
+            return None, 0
+
+        result = process.extractOne(source, candidates, scorer=fuzz.token_set_ratio)
+
+        # ✅ If no match found, return safely
+        if not result or len(result) < 2:
+            return None, 0
+
+        match, score = result[0], result[1]
+        sim = semantic_similarity(source, match) if use_embedding_sim else 0
+        return match, max(score, sim * 100)
+
+    # 1️⃣ Signal asset check
+    for asset, meta in signal_assets.items():
+        score = fuzz.token_set_ratio(t, asset.lower())
+        if score > fuzzy_threshold:
+            return "Asset", {**meta, "match": asset, "score": score}
+
+    # 2️⃣ Failure codes
+    for f in rail_failure_dict:
+        code, desc = f["failure_code"].lower(), f["failure_desc"].lower()
+        score = max(fuzz.token_set_ratio(t, code), fuzz.token_set_ratio(t, desc))
+        if score > fuzzy_threshold:
+            return "Failure", {"department": f["department"], "code": f["failure_code"], "score": score}
+
+    # 3️⃣ Department assets
+    for dept, assets in railway_assets.items():
+        match, score = match_score(t, assets)
+        if score > fuzzy_threshold:
+            return "Asset", {"department": dept, "asset_type": match, "score": score}
+
+    # 4️⃣ Organizational hierarchy
+    if any(k in t for k in ["division", "zone", "board", "headquarters"]):
+        return "Organization", {"score": 90}
+
+    # 5️⃣ Station or Yard
+    if "station" in t:
+        return "Station", {"score": 95}
+    if "yard" in t:
+        return "Yard", {"score": 95}
+
+    return "Generic", {"score": 50}
+
+def add_to_graph(entities, relations, file_id):
+    print("🧠 Starting KG extraction for uploaded JSON...")
+    entity_count, relation_count = 0, 0
+
+    try:
+        with driver.session() as session:
+            for e in entities:
+                session.execute_write(create_entity_node, e, file_id)
+                entity_count += 1
+
+            # Deduplicate relations
+            unique_relations = {tuple(sorted(r.items())) if isinstance(r, dict) else r for r in relations}
+            for r in unique_relations:
+                session.execute_write(create_relation_node, r, file_id)
+                relation_count += 1
+
+    except Exception as e:
+        print(f"❌ Graph insertion failed: {e}")
+
+    print(f"✅ Completed KG insertion — {entity_count} entities, {relation_count} relations.")
 
 
 def create_failure_kg_node(tx, failure, file_id):
@@ -1074,22 +1532,104 @@ def create_failure_kg_node(tx, failure, file_id):
 
 
 
-def create_asset_kg_node(tx, asset_name, file_id):
-    tx.run("""
-        MERGE (a:Asset {name: $asset_name})
-        SET a.file_id = $file_id
-    """, asset_name=asset_name, file_id=str(file_id))
+def create_asset_kg_node(tx, asset, file_id):
+    """
+    Create or link an asset node to existing KG hierarchy.
+    Reuses existing Zone, Division, Section, and GearGroup nodes when possible.
+    """
 
+    q = """
+    // --- Match existing base hierarchy ---
+    OPTIONAL MATCH (z:Zone {name:$zone})
+    OPTIONAL MATCH (d:Division {name:$division})-[:PART_OF]->(z)
+    OPTIONAL MATCH (s:Section {name:$section})-[:PART_OF]->(d)
+    OPTIONAL MATCH (g:GearGroup {name:$gear_group})
+    OPTIONAL MATCH (dept:Department {name:$department})
+
+    // --- Create asset node if missing ---
+    MERGE (a:Asset {name:$asset_name})
+      ON CREATE SET
+        a.asset_type = $asset_type,
+        a.gear_name = $gear_name,
+        a.department = $department,
+        a.created_at = datetime(),
+        a.source_file = $file_id
+      ON MATCH SET
+        a.last_seen = datetime(),
+        a.source_file = $file_id
+
+    // --- Link asset to hierarchy ---
+    FOREACH (_ IN CASE WHEN z IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (a)-[:UNDER_ZONE]->(z))
+    FOREACH (_ IN CASE WHEN d IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (a)-[:UNDER_DIVISION]->(d))
+    FOREACH (_ IN CASE WHEN s IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (a)-[:UNDER_SECTION]->(s))
+    FOREACH (_ IN CASE WHEN g IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (a)-[:BELONGS_TO_GROUP]->(g))
+    FOREACH (_ IN CASE WHEN dept IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (a)-[:MAINTAINED_BY]->(dept))
+    """
+
+    # Clean and normalize before sending to Cypher
+    data = {
+        "zone": asset.get("Zone", "").strip(),
+        "division": asset.get("Division", "").strip(),
+        "section": asset.get("Section", "").strip(),
+        "gear_group": asset.get("Gear Group", "").strip() or asset.get("Gear Type", "").strip(),
+        "asset_name": asset.get("Gear Name/Number", "").strip(),
+        "asset_type": asset.get("Asset Type", "").strip(),
+        "gear_name": asset.get("Gear Name/Number", "").strip(),
+        "department": asset.get("Department", "").strip(),
+        "file_id": str(file_id),
+    }
+
+    tx.run(q, **data)
+
+def extract_relations(text):
+    doc = nlp(text)
+    triples = []
+    for sent in doc.sents:
+        subj = None
+        obj = None
+        verb = None
+        for token in sent:
+            if "subj" in token.dep_:
+                subj = token.text
+            if "obj" in token.dep_:
+                obj = token.text
+            if token.pos_ == "VERB":
+                verb = token.lemma_
+        if subj and verb and obj:
+            triples.append((subj, verb, obj))
+    return triples
+
+
+def create_entity_node(tx, entity, file_id):
+    """
+    Safely create Entity nodes with labels and file link.
+    """
+    text = entity.get("text", "").strip()
+    label = entity.get("label", "Generic").strip()
+    if not text:
+        return
+
+    tx.run("""
+        MERGE (e:Entity {text: $text})
+        SET e.label = $label,
+            e.file_id = $file_id,
+            e.meta = $meta
+        MERGE (e)-[:MENTIONED_IN]->(f:File {id: $file_id})
+    """, text=text, label=label, meta=json.dumps(entity.get("meta", {})), file_id=str(file_id))
 
 
 def create_relation_node(tx, relation, file_id):
-    """Insert entity relations safely, handling tuple and dict types."""
-    
-    # --- Normalize relation type ---
+    """Insert entity relations safely, with sanitized relation type."""
+    # Normalize input
     if isinstance(relation, tuple):
         if len(relation) == 3:
             from_text, rel_type, to_text = relation
-        elif len(relation) == 2:  # fallback if only from & to provided
+        elif len(relation) == 2:
             from_text, to_text = relation
             rel_type = "RELATED_TO"
         else:
@@ -1099,24 +1639,24 @@ def create_relation_node(tx, relation, file_id):
         to_text = relation.get("to", "").strip()
         rel_type = relation.get("type", "RELATED_TO").strip()
     else:
-        return  # skip if not tuple/dict
-    
+        return
+
     if not from_text or not to_text:
         return
 
-    # --- Create/merge nodes and relation ---
-    tx.run(f"""
+    # Sanitize relation type
+    safe_rel_type = re.sub(r"[^A-Za-z0-9_]", "_", rel_type.upper())
+
+    cypher = f"""
         MERGE (a:Entity {{text: $from_text}})
         MERGE (b:Entity {{text: $to_text}})
-        MERGE (a)-[r:{rel_type}]->(b)
+        MERGE (a)-[r:{safe_rel_type}]->(b)
         MERGE (a)-[:MENTIONED_IN]->(f:File {{id: $file_id}})
         MERGE (b)-[:MENTIONED_IN]->(f)
-    """, from_text=from_text, to_text=to_text, file_id=str(file_id))
-
-
+    """
+    tx.run(cypher, from_text=from_text, to_text=to_text, file_id=str(file_id))
 
 # --------------------------- Routes --------------------------------
-
 
 @app.route("/", methods=["GET"])
 def dashboard():
@@ -1163,10 +1703,10 @@ def upload_json():
                     file_id, file_name = process_and_store_file_with_check(abs_path)
                     file_doc = mongo.db.files.find_one({"_id": file_id})
                     text_content = " ".join(flatten_text(file_doc["data"]))
-                    entities = extract_entities(text_content)
-                    triples = extract_relations(text_content)
-                    add_to_graph(entities, triples, file_id)
-                    flash(f"Uploaded: {file_name}", "success")
+                    #entities = extract_entities(text_content)
+                    #triples = extract_relations(text_content)
+                    #add_to_graph(entities, triples, file_id)
+                    #flash(f"Uploaded: {file_name}", "success")
                     total_uploaded += 1
                 except Exception as e:
                     skipped_files.append(f"{file_path} (error: {str(e)})")
@@ -1226,6 +1766,7 @@ def upload():
             file.seek(0)
             file_id = fs.put(file, filename=filename, contentType=file.mimetype)
             file.seek(0)
+
             try:
                 if filetype in {"xlsx", "xls"}:
                     file_data = process_excel(file)
@@ -1252,37 +1793,58 @@ def upload():
 
             # --- Extract failures & assets ---
             failures = extract_failure_codes(file_data)
-            assets = [f for f in failures if f.get("user_asset_failure","Y") == "Y"]
+            assets = [f for f in failures if f.get("user_asset_failure", "Y") == "Y"]
 
-            # --- Insert file into MongoDB ---
-            inserted = mongo.db.files.insert_one({"filename": filename, "filetype": filetype, "file_id": file_id, "search_text": search_text, "embedding": embedding.tolist(), "upload_time": datetime.datetime.utcnow(), "data": cleaned_data})
-
-
+            # --- Insert main record into MongoDB ---
+            inserted = mongo.db.files.insert_one({
+                "filename": filename,
+                "filetype": filetype,
+                "file_id": file_id,
+                "search_text": search_text,
+                "embedding": embedding.tolist(),
+                "upload_time": datetime.datetime.utcnow(),
+                "data": cleaned_data
+            })
             file_id = inserted.inserted_id
-            try:
-                add_to_faiss(str(file_id), embedding, normalize=True)
-            except Exception as e:
-                app.logger.exception("Failed to add to FAISS: %s", e)
-            # --- Insert failures & assets into Neo4j KG ---
-            with driver.session() as session:
-                for failure in failures:
-                    session.execute_write(create_failure_kg_node, failure, file_id)
-                for asset in assets:
-                    session.execute_write(create_asset_kg_node, asset, file_id)
 
-            # --- Extract entities & relations from text and add to KG ---
-            entities = extract_entities(search_text)
-            relations  = extract_relations(search_text)
-            try:
-                add_to_graph(entities, relations, file_id)
-            except Exception as e:
-                app.logger.exception(f"Failed to add KG entities/relations: {e}")
+            # --- Async / background operations for speed ---
+            def background_tasks():
+                try:
+                    # Add embedding to FAISS
+                    add_to_faiss(str(file_id), embedding, normalize=True)
+                except Exception as e:
+                    app.logger.exception("Failed to add to FAISS: %s", e)
 
-            print(f"Added {len(entities)} entities and {len(relations)} relations to KG")
-            # --- Add to FAISS ---
-            
+                # Add failures & assets to Neo4j
+                try:
+                    with driver.session() as session:
+                        for failure in failures:
+                            failure = map_to_existing_entities(failure)
+                            code = failure.get("failure_code")
+                            if not session.execute_read(failure_exists, code):
+                                session.execute_write(link_failure_to_existing_nodes, failure, file_id)
+                                print(f"Added failure code to KG: {code}")
+                        for asset in assets:
+                            asset_name = asset.get("asset_name")
+                            if not session.execute_read(asset_exists, asset_name):
+                                session.execute_write(create_asset_kg_node, asset, file_id)
+                                print(f"Added asset to KG: {asset_name}")
+                except Exception as e:
+                    app.logger.exception("Neo4j failure: %s", e)
 
-            flash("File uploaded, processed & indexed successfully", "success")
+                # Add extracted entities & relations to KG
+                try:
+                    entities = extract_entities(search_text)
+                    relations = extract_relations(search_text)
+                    add_to_graph(entities, relations, file_id)
+                    print(f"Added {len(entities)} entities and {len(relations)} relations to KG")
+                except Exception as e:
+                    app.logger.exception(f"KG entity/relationship add failed: {e}")
+
+            # --- Run background tasks in a separate thread ---
+            threading.Thread(target=background_tasks, daemon=True).start()
+
+            flash("File uploaded, processed & indexed successfully (background processing running)", "success")
             return redirect(url_for("dashboard"))
 
         flash("Invalid file type. Allowed: .xlsx, .pdf, images", "danger")
@@ -1541,9 +2103,6 @@ def regex_fallback(query):
 
 # Load FAISS index already called above
 
-
-
-
 def get_failures_by_keyword(keyword):
     with driver.session() as session:
         result = session.run("""
@@ -1762,24 +2321,124 @@ def refine_query_terms(query: str) -> list:
     return key_terms
 
 # 🧩 --- Summarization helper ---
-from itertools import combinations
-import re
 
+# Cached global reranker (loads once)
+onnx_reranker = None
+def safe_summarize_text(summarizer, text, min_len=100, max_len=300, max_model_input=900):
+    """
+    Safely summarize text by truncating it to the model’s input size limit.
+    Prevents 'index out of range' errors for long sequences.
+    """
+    if not text or not summarizer:
+        return ""
+
+    # Clean + limit to model capacity (approx 900 tokens ≈ ~1500 words)
+    tokens = text.split()
+    if len(tokens) > max_model_input:
+        text = " ".join(tokens[:max_model_input])
+
+    try:
+        result = summarizer(
+            text,
+            max_length=max_len,
+            min_length=min_len,
+            do_sample=False
+        )
+        if isinstance(result, list) and result and "summary_text" in result[0]:
+            return result[0]["summary_text"].strip()
+
+    except Exception as e:
+        app.logger.error(f"⚠️ Summarization failed safely: {e}", exc_info=True)
+
+    # Fallback to truncated original
+    return text[:700]
+
+def load_onnx_reranker(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2"):
+    """
+    Load an ONNX quantized CrossEncoder model for CPU inference.
+    """
+    global onnx_reranker
+
+    if onnx_reranker:
+        return onnx_reranker
+
+    # Download or load quantized ONNX version
+    model_path = f"./onnx_reranker/{model_name.replace('/', '_')}.onnx"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    try:
+        ort_session = ort.InferenceSession(
+            model_path,
+            providers=["CPUExecutionProvider"],
+            sess_options=ort.SessionOptions()
+        )
+    except Exception as e:
+        # If no ONNX model yet, export from original model once
+        print("Exporting CrossEncoder to ONNX...")
+        ce = CrossEncoder(model_name)
+        ce.save_pretrained("./onnx_reranker")
+        tokenizer.save_pretrained("./onnx_reranker")
+
+        # Convert via torch → ONNX (first-time only)
+        import torch
+
+        inputs = tokenizer("example question", "example answer", return_tensors="pt")
+        torch.onnx.export(
+            ce.model,
+            (inputs["input_ids"], inputs["attention_mask"]),
+            model_path,
+            input_names=["input_ids", "attention_mask"],
+            output_names=["logits"],
+            dynamic_axes={
+                "input_ids": {0: "batch", 1: "sequence"},
+                "attention_mask": {0: "batch", 1: "sequence"},
+            },
+            opset_version=14
+        )
+        ort_session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+
+    onnx_reranker = {"session": ort_session, "tokenizer": tokenizer}
+    return onnx_reranker
+
+
+def rerank_with_onnx(query, docs, top_k=10):
+    """
+    Given a query and list of text docs, return reranked docs (sorted by score).
+    """
+    rr = load_onnx_reranker()
+    tok = rr["tokenizer"]
+    session = rr["session"]
+
+    pairs = [(query, d) for d in docs]
+    enc = tok([p[0] for p in pairs], [p[1] for p in pairs],
+              padding=True, truncation=True, max_length=512, return_tensors="np")
+
+    ort_inputs = {
+        "input_ids": enc["input_ids"],
+        "attention_mask": enc["attention_mask"]
+    }
+    logits = session.run(None, ort_inputs)[0].squeeze(-1)
+
+    # Attach scores back to docs
+    scored = [{"text": d, "score": float(s)} for d, s in zip(docs, logits)]
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_k]
 
 
 def tokenize(text):
     """Return a set of lowercase words in the text."""
     return set(re.findall(r'\b\w+\b', text.lower()))
 
+
 def summarize_relevant_chunks(full_text, query, summarizer,
-                              min_para_len=250, max_chunks=10,
+                              min_para_len=250, max_chunks=5,
                               chunk_size=2000, overlap=300,
                               min_summary_len=100, max_summary_len=300,
                               max_chunk_chars=2000):
     """
     Extract relevant paragraphs, merge into large chunks,
-    rank chunks independently (AND → OR), and summarize top chunks.
-    Only truncate chunks if exceeding model max length to preserve flow.
+    filter to chunks containing all query terms (AND),
+    and summarize top relevant chunks safely.
     """
 
     # Step 1: Extract relevant paragraphs
@@ -1789,7 +2448,10 @@ def summarize_relevant_chunks(full_text, query, summarizer,
 
     if not matched_paragraphs:
         print("No relevant paragraphs found. Using fallback.")
-        return full_text[:1000]
+        return {
+            "final_summary": full_text[:1000],
+            "summaries_with_ids": []
+        }
 
     print(f"Found {len(matched_paragraphs)} relevant paragraphs.")
 
@@ -1798,59 +2460,82 @@ def summarize_relevant_chunks(full_text, query, summarizer,
     n = len(text_to_summarize)
     chunks = []
     start = 0
+    chunk_id = 1
     while start < n:
         end = start + chunk_size
-        chunks.append(text_to_summarize[start:end])
+        chunks.append({
+            "id": f"chunk_{chunk_id}",
+            "text": text_to_summarize[start:end]
+        })
+        chunk_id += 1
         start += (chunk_size - overlap)
 
-    # Step 3: Rank chunks independently (AND → OR)
+    # Step 3: Filter chunks (strict AND operation)
     query_terms = [t.lower() for t in re.findall(r'\b\w+\b', query)]
+    filtered_chunks = [
+        c for c in chunks
+        if all(qt in c["text"].lower() for qt in query_terms)
+    ]
+
+    # Fallback to OR if no AND match
+    if not filtered_chunks:
+        print("⚠️ No chunks contained all query terms. Falling back to OR matching.")
+        filtered_chunks = [
+            c for c in chunks
+            if any(qt in c["text"].lower() for qt in query_terms)
+        ]
+
+    if not filtered_chunks:
+        print("⚠️ Still no matching chunks. Using fallback first chunk.")
+        filtered_chunks = [chunks[0]]
+
+    print(f"Filtering kept {len(filtered_chunks)} chunks (strict AND logic applied).")
+
+    # Step 4: Rank chunks
     ranked_chunks = []
+    for c in filtered_chunks:
+        rank, rank_type = chunk_rank(c["text"], query_terms)
+        ranked_chunks.append((c, rank, rank_type))
 
-    for idx, chunk in enumerate(chunks):
-        rank, rank_type = chunk_rank(chunk, query_terms)
-        if rank > 0:
-            ranked_chunks.append((chunk, rank, rank_type))
-            print(f"Chunk {idx+1}: rank={rank} ({rank_type})")
-
-    if not ranked_chunks:
-        print("No chunks matched query terms. Using fallback.")
-        ranked_chunks = [(text_to_summarize[:chunk_size], 0, "fallback")]
-
-    # Sort by rank descending (AND first, then OR)
     ranked_chunks.sort(key=lambda x: x[1], reverse=True)
     top_chunks = [x[0] for x in ranked_chunks[:max_chunks]]
 
-    print(f"Summarizing top {len(top_chunks)} ranked chunks...")
+    print(f"Summarizing top {len(top_chunks)} relevant chunks...")
 
-    # Step 4: Summarize top chunks safely
-    summaries = []
+    # Step 5: Summarize each chunk safely
+    summaries_with_ids = []
     for idx, chunk in enumerate(top_chunks):
-        # Only truncate if chunk is too long for the model
-        if len(chunk) > max_chunk_chars:
-            chunk_to_summarize = chunk[:max_chunk_chars]
-            print(f"Chunk {idx+1} truncated to {len(chunk_to_summarize)} chars for model.")
+        text = chunk["text"].strip()
+
+        # Skip re-summarization if text already looks summarized
+        if len(text) < 350 or "summary" in text.lower() or "key points" in text.lower():
+            summary = text[:max_summary_len]
+            print(f"🟡 Skipped summarization for {chunk['id']} (already short/summarized).")
         else:
-            chunk_to_summarize = chunk
-
-        try:
-            result = summarizer(
-                chunk_to_summarize,
-                max_length=max_summary_len,
-                min_length=min_summary_len,
-                do_sample=False
+            summary = safe_summarize_text(
+                summarizer,
+                text,
+                min_len=min_summary_len,
+                max_len=max_summary_len,
+                max_model_input=900
             )
-            if result and isinstance(result, list) and "summary_text" in result[0]:
-                summaries.append(result[0]["summary_text"].strip())
-                print(f"Chunk {idx+1} summary preview: {result[0]['summary_text'][:100]}...")
-            else:
-                print(f"⚠️ Chunk {idx+1} summarizer returned empty output. Skipping.")
-        except Exception as e:
-            print(f"⚠️ Skipping chunk {idx+1} due to summarization error: {e}")
 
-    # Step 5: Merge summaries
-    final_summary = " ".join(summaries)
-    return final_summary.strip()
+        if summary:
+            summaries_with_ids.append({
+                "chunk_id": chunk["id"],
+                "summary": summary
+            })
+            print(f"✅ {chunk['id']} summarized successfully ({len(summary)} chars).")
+        else:
+            print(f"⚠️ {chunk['id']} produced no summary (skipped).")
+
+    # Step 6: Merge summaries
+    final_summary = " ".join(s["summary"] for s in summaries_with_ids).strip()
+
+    return {
+        "final_summary": final_summary or text_to_summarize[:1000],
+        "summaries_with_ids": summaries_with_ids
+    }
 
 
 # Independent AND/OR ranking for a single chunk
@@ -1889,17 +2574,7 @@ def analyze_text_summary(text):
     return analysis
 
 
-import re
-
-import re
-
-import re
-from itertools import combinations
-
-import re
-from itertools import combinations
-
-def extract_relevant_paragraphs(full_text, query, min_len=250, max_chunks=10, fallback_sentence_chunk=8):
+def extract_relevant_paragraphs(full_text, query, min_len=250, max_chunks=5, fallback_sentence_chunk=8):
     """
     Extract paragraphs that match the query progressively:
     - Try paragraphs containing all query terms (AND)
@@ -1939,9 +2614,7 @@ def extract_relevant_paragraphs(full_text, query, min_len=250, max_chunks=10, fa
 
     return selected_paragraphs
 
-import re
-import math
-from itertools import combinations
+
 
 def rank_and_score_document(full_text, query, query_terms, base_score=0.0):
     """
@@ -1985,6 +2658,448 @@ def rank_and_score_document(full_text, query, query_terms, base_score=0.0):
     return final_score, rank_type
 
 
+# --- Retrieve related entities for query expansion ---
+def kg_expand_query(term, max_hops=2):
+    """
+    Given a term like 'signal failure' or 'gear fuse',
+    find related assets, failures, stations, and departments from KG.
+    Searches across multiple property names (case-insensitive) and expands up to N hops.
+    Does NOT depend on APOC.
+    """
+    try:
+        # cache key based on term + max_hops
+        cache_key = f"expand:{term.strip().lower()}:{int(max_hops)}"
+        cached = _cache_get(KG_EXPAND_CACHE, cache_key)
+        if cached is not None:
+            return cached
+        with driver.session() as session:
+            q = f"""
+            MATCH (n)
+            WHERE any(x IN [
+                coalesce(n.name, ''),
+                coalesce(n.code, ''),
+                coalesce(n.failure_entry_no, coalesce(n.Failure_Entry_No, '')),
+                coalesce(n.zone, coalesce(n.Zone, '')),
+                coalesce(n.division, coalesce(n.Division, '')),
+                coalesce(n.section, coalesce(n.Section, '')),
+                coalesce(n.station_code, coalesce(n.Station_Code, '')),
+                coalesce(n.department, coalesce(n.Department, '')),
+                coalesce(n.gear_name, coalesce(n.Gear_Name, '')),
+                coalesce(n.cause, coalesce(n.Cause, '')),
+                coalesce(n.remarks, coalesce(n.Remarks, ''))
+            ] WHERE toLower(x) CONTAINS toLower($term))
+
+            // Expand relationships up to N hops in both directions
+            OPTIONAL MATCH (n)-[*1..{max_hops}]-(m)
+            WITH COLLECT(DISTINCT m) + COLLECT(DISTINCT n) AS nodes
+
+            UNWIND nodes AS node
+            RETURN DISTINCT coalesce(
+                node.name,
+                node.code,
+                node.failure_entry_no,
+                node.Failure_Entry_No,
+                node.zone,
+                node.Zone,
+                node.division,
+                node.Division,
+                node.section,
+                node.Section,
+                node.station_code,
+                node.Station_Code,
+                node.department,
+                node.Department,
+                node.gear_name,
+                node.Gear_Name,
+                node.cause,
+                node.Cause,
+                node.remarks,
+                node.Remarks
+            ) AS name
+            LIMIT 50
+            """
+            res = timed_run(session, q, term=term)
+            related_terms = [r["name"] for r in res if r["name"]]
+            out = list(set(related_terms))
+            _cache_set(KG_EXPAND_CACHE, cache_key, out)
+            return out
+
+    except Exception as e:
+        app.logger.warning(f"⚠️ KG expand failed for term '{term}': {e}")
+        return []
+
+# --- Retrieve failures connected to key nodes ---
+def kg_get_related_failures(query_terms):
+    """
+    Retrieve Failure nodes related to KG entities (zones, stations, gears, etc.).
+    Case-insensitive, direction-agnostic, multi-term friendly.
+    Returns up to 100 relevant records.
+    """
+    if not query_terms:
+        return []
+
+    terms = [t.lower().strip() for t in query_terms if t.strip()]
+
+    try:
+        # cache key
+        cache_key = "related_failures:" + ",".join(sorted(query_terms))
+        cached = _cache_get(KG_RELATED_FAILURES_CACHE, cache_key)
+        if cached is not None:
+            return cached
+        with driver.session() as session:
+            q = """
+            // Match failures and any connected nodes (any direction)
+            MATCH (f:Failure)
+            OPTIONAL MATCH (f)-[*0..2]-(x)
+            WHERE any(t IN $terms WHERE
+                // check all relevant fields on f and related nodes
+                any(val IN [
+                    coalesce(f.failure_entry_no, f.Failure_Entry_No, ''),
+                    coalesce(f.zone, f.Zone, ''),
+                    coalesce(f.division, f.Division, ''),
+                    coalesce(f.section, f.Section, ''),
+                    coalesce(f.station_code, f.Station_Code, ''),
+                    coalesce(f.department, f.Department, ''),
+                    coalesce(f.gear_name, f.Gear_Name, ''),
+                    coalesce(f.cause, f.Cause, ''),
+                    coalesce(f.action, f.Action, ''),
+                    coalesce(f.remarks, f.Remarks, ''),
+                    coalesce(x.name, ''),
+                    coalesce(x.code, ''),
+                    coalesce(x.gear_name, ''),
+                    coalesce(x.zone, ''),
+                    coalesce(x.division, ''),
+                    coalesce(x.station_code, '')
+                ] WHERE toLower(val) CONTAINS t)
+            )
+            RETURN DISTINCT
+                coalesce(f.failure_entry_no, f.Failure_Entry_No) AS failure_entry_no,
+                coalesce(f.zone, f.Zone) AS zone,
+                coalesce(f.division, f.Division) AS division,
+                coalesce(f.section, f.Section) AS section,
+                coalesce(f.station_code, f.Station_Code) AS station_code,
+                coalesce(f.department, f.Department) AS department,
+                coalesce(f.gear_name, f.Gear_Name) AS gear_name,
+                coalesce(f.cause, f.Cause) AS cause,
+                coalesce(f.action, f.Action) AS action,
+                coalesce(f.remarks, f.Remarks) AS remarks
+            LIMIT 100
+            """
+
+            res = timed_run(session, q, terms=terms)
+            results = [dict(r) for r in res]
+            _cache_set(KG_RELATED_FAILURES_CACHE, cache_key, results)
+
+            # Optional lightweight relevance scoring
+            for r in results:
+                text = " ".join(str(v or "").lower() for v in r.values())
+                r["_score"] = sum(text.count(t) for t in terms)
+
+            # Sort by relevance
+            results.sort(key=lambda x: x.get("_score", 0), reverse=True)
+            return results
+
+    except Exception as e:
+        print(f"[KG] Query failed: {e}")
+        return []
+
+def kg_entity_importance(entity_text: str, max_hops: int = 2) -> float:
+    """
+    Compute a robust importance score for an entity using Neo4j.
+    Factors:
+      - Relationship degree (direct links)
+      - Relation type diversity
+      - Connectivity depth (up to N hops)
+      - Case-insensitive + partial matching
+    Returns: normalized float score
+    """
+    import math
+
+    if not entity_text or len(entity_text.strip()) < 2:
+        return 0.0
+
+    try:
+        cache_key = f"importance:{entity_text.strip().lower()}:{int(max_hops)}"
+        cached = _cache_get(KG_IMPORTANCE_CACHE, cache_key)
+        if cached is not None:
+            return cached
+        with driver.session() as session:
+            try:
+                # --- Try APOC version first ---
+                cypher = f"""
+                // 1️⃣ Find matching entities (case-insensitive, partial)
+                MATCH (e:Entity)
+                WHERE toLower(e.text) CONTAINS toLower($entity)
+
+                // 2️⃣ Count direct and indirect relationships using APOC
+                OPTIONAL MATCH (e)-[r*1..{max_hops}]-(n:Entity)
+                WITH e, apoc.coll.flatten(r) AS rels, collect(DISTINCT n) AS connected_nodes
+
+                // 3️⃣ Compute richness metrics
+                WITH e,
+                     size(connected_nodes) AS reach,
+                     size(rels) AS total_links,
+                     apoc.coll.toSet([rel IN rels | type(rel)]) AS rel_types
+
+                RETURN e.text AS entity,
+                       reach,
+                       total_links,
+                       size(rel_types) AS relation_variety
+                ORDER BY reach DESC
+                LIMIT 1
+                """
+                record = timed_run(session, cypher, entity=entity_text).single()
+
+            except Exception as e_apoc:
+                # --- Fallback: APOC not available ---
+                app.logger.warning(f"[KG] APOC not available, using fallback for '{entity_text}': {e_apoc}")
+                cypher = f"""
+                MATCH (e:Entity)
+                WHERE toLower(e.text) CONTAINS toLower($entity)
+                OPTIONAL MATCH (e)-[r*1..{max_hops}]-(n:Entity)
+                WITH e, collect(DISTINCT n) AS connected_nodes,
+                     collect(DISTINCT type(r[0])) AS rel_types
+                RETURN e.text AS entity,
+                       size(connected_nodes) AS reach,
+                       size(rel_types) AS relation_variety,
+                       0 AS total_links
+                ORDER BY reach DESC
+                LIMIT 1
+                """
+                record = timed_run(session, cypher, entity=entity_text).single()
+
+            if not record:
+                _cache_set(KG_IMPORTANCE_CACHE, cache_key, 0.0)
+                return 0.0
+
+            # --- Safely extract numeric values ---
+            reach = record.get("reach") or 0
+            total_links = record.get("total_links") or 0
+            variety = record.get("relation_variety") or 0
+
+            # --- Weighted composite score ---
+            score = (reach * 0.6 + variety * 0.4) * (1 + math.log1p(total_links))
+            score = math.log1p(score) * 2  # normalization
+
+            score_r = round(score, 3)
+            _cache_set(KG_IMPORTANCE_CACHE, cache_key, score_r)
+            return score_r
+
+    except Exception as e:
+        app.logger.warning(f"⚠️ KG importance lookup failed for '{entity_text}': {e}")
+        return 0.0
+
+# --- Default CPU-friendly base model ---
+base_model_name = "distilgpt2"  # small, fast, CPU-friendly
+
+# Load tokenizer and base model
+tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+base_model = AutoModelForCausalLM.from_pretrained(base_model_name)
+
+# --- LoRA adapter path ---
+# For default testing, you can skip LoRA and use base_model directly on CPU
+# If you later train a LoRA adapter, replace "./lora_cpu_model" with its path
+try:
+    lora_checkpoint = "./lora_railway_model/checkpoint-642"
+    lora_model = PeftModel.from_pretrained(model, lora_checkpoint)
+except:
+    print("⚠️ No LoRA model found, using base model on CPU")
+    lora_model = base_model
+
+# --- Pipeline for text generation on CPU ---
+llm_pipe = pipeline(
+    "text-generation",
+    model=lora_model,
+    tokenizer=tokenizer,
+    device=-1,  # CPU
+    max_length=512
+)
+
+# --- Utility: chunk extraction ---
+def chunk_text(text, max_tokens=2000, overlap=200):
+    """
+    Split text into overlapping token chunks.
+    """
+    # Tokenizer-based chunking (for transformers) but we also support
+    # recursive splitting for very long text when using remote embedding APIs.
+    try:
+        tokens = tokenizer.encode(text, truncation=False)
+        chunks = []
+        start = 0
+        while start < len(tokens):
+            end = start + max_tokens
+            chunk_tokens = tokens[start:end]
+            ctext = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+            chunks.append(ctext)
+            start += (max_tokens - overlap)
+        return chunks
+    except Exception:
+        # Fallback: simple char-based split preserving paragraph boundaries
+        paragraphs = re.split(r"\n{2,}|\r{2,}|\n", text)
+        chunks = []
+        cur = ""
+        for p in paragraphs:
+            if len(cur) + len(p) + 1 <= max_tokens * 4:
+                cur = (cur + "\n\n" + p).strip()
+            else:
+                if cur:
+                    chunks.append(cur)
+                cur = p
+        if cur:
+            chunks.append(cur)
+        # ensure overlap by merging adjacent chunks if needed
+        if overlap and len(chunks) > 1:
+            merged = []
+            for i in range(0, len(chunks)):
+                merged.append(chunks[i])
+            return merged
+        return chunks
+
+
+# --- Utility: select top-k chunks by cosine similarity ---
+
+
+# Embedding helpers - prefer OpenAI embeddings when configured, fallback to
+# sentence-transformers locally. This section implements a recursive splitting
+# strategy to ensure each piece sent to the embedding model fits token/char
+# limits. It also batches requests to the embedding API with retries.
+
+# Fallback HF model
+embed_model = None
+try:
+    embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+except Exception:
+    embed_model = None
+
+# OpenAI embedding configuration
+OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+OPENAI_ENABLED = bool(os.getenv("OPENAI_API_KEY"))
+if OPENAI_ENABLED:
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+
+
+def recursive_split_text(text, max_chars=3000):
+    """Recursively split text into pieces smaller than max_chars while
+    trying to respect paragraph/sentence boundaries.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    if len(text) <= max_chars:
+        return [text]
+
+    # Prefer split on double newline (paragraph), then sentence boundary, then mid-point
+    parts = re.split(r"\n{2,}", text)
+    if len(parts) > 1:
+        out = []
+        cur = ""
+        for p in parts:
+            if len((cur + "\n\n" + p).strip()) <= max_chars:
+                cur = (cur + "\n\n" + p).strip()
+            else:
+                if cur:
+                    out.extend(recursive_split_text(cur, max_chars))
+                cur = p
+        if cur:
+            out.extend(recursive_split_text(cur, max_chars))
+        return out
+
+    # Fallback to sentence splits
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    out = []
+    cur = ""
+    for s in sentences:
+        if len((cur + " " + s).strip()) <= max_chars:
+            cur = (cur + " " + s).strip()
+        else:
+            if cur:
+                out.append(cur)
+            cur = s
+    if cur:
+        out.append(cur)
+
+    # If still oversized (very long sentence), split by midpoint
+    for i, o in enumerate(out):
+        if len(o) > max_chars:
+            mid = len(o) // 2
+            out[i:i+1] = recursive_split_text(o[:mid], max_chars) + recursive_split_text(o[mid:], max_chars)
+    return out
+
+
+def batch_get_openai_embeddings(texts, model_name=OPENAI_EMBED_MODEL, batch_size=16, retries=3):
+    embeddings = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        attempt = 0
+        while attempt < retries:
+            try:
+                resp = openai.Embedding.create(input=batch, model=model_name)
+                batch_emb = [np.array(d["embedding"], dtype="float32") for d in resp["data"]]
+                embeddings.extend(batch_emb)
+                break
+            except Exception as e:
+                attempt += 1
+                wait = 1.0 * attempt
+                time.sleep(wait)
+                if attempt >= retries:
+                    raise
+    return embeddings
+
+
+def get_embeddings(texts, use_openai=OPENAI_ENABLED):
+    """Return list of numpy embeddings for `texts`.
+    If OpenAI is configured, use it. Otherwise fall back to sentence-transformers.
+    """
+    if use_openai:
+        # Recursively ensure each text is within safe char limits
+        safe_texts = []
+        for t in texts:
+            if not t:
+                safe_texts.append("")
+            elif len(t) > 3000:
+                safe_texts.extend(recursive_split_text(t, max_chars=3000))
+            else:
+                safe_texts.append(t)
+        return batch_get_openai_embeddings(safe_texts)
+
+    # Fallback to local model
+    if embed_model is None:
+        raise RuntimeError("No embedding model available: set OPENAI_API_KEY or install sentence-transformers")
+    emb = embed_model.encode(texts, convert_to_numpy=True)
+    # sentence-transformers may return shape (n, d)
+    return [np.asarray(e, dtype="float32") for e in emb]
+
+
+def select_top_chunks(chunks, query, top_k=3):
+    """Select top_k chunks most relevant to query, using embeddings.
+    Uses OpenAI embeddings when available, else local model.
+    """
+    # Prepare inputs: we will embed chunks and the query
+    texts = [query] + chunks
+    embs = get_embeddings(texts)
+    query_emb = embs[0]
+    chunk_embs = embs[1:]
+    sims = [float(cosine_similarity(query_emb.reshape(1, -1), ce.reshape(1, -1))[0][0]) for ce in chunk_embs]
+    ranked = sorted(zip(chunks, sims), key=lambda x: x[1], reverse=True)
+    return [c for c, _ in ranked[:top_k]]
+
+
+def safe_chunk_embeddings(chunks, query, top_k=5):
+    """Return top_k chunks relevant to query with robust embedding creation.
+    This will recursively split oversized chunks before embedding.
+    """
+    # Recursively split any chunk that exceeds OpenAI safe limits
+    processed = []
+    for c in chunks:
+        if OPENAI_ENABLED and len(c) > 3000:
+            processed.extend(recursive_split_text(c, max_chars=3000))
+        else:
+            processed.append(c)
+
+    return select_top_chunks(processed, query, top_k=top_k)
+
+
+
 # 🧩 --- Your existing search route with summarization + analysis integrated ---
 @app.route("/search", methods=["GET"])
 def search():
@@ -1995,40 +3110,67 @@ def search():
 
     app.logger.info(f"Search query='{query}' summarize={summarize_flag} analyze={analyze_flag}")
 
+    # --- Step 0: Empty query guard ---
     if not query:
-        return render_template("search.html", results=[], query="") \
-            if request.accept_mimetypes.accept_html else jsonify({"type": "none", "results": []})
+        return (
+            render_template("search.html", results=[], query="")
+            if request.accept_mimetypes.accept_html
+            else jsonify({"type": "none", "results": []})
+        )
 
-    # --- Refine query terms ---
+    # --- Step 1: Refine query ---
     refined_terms = refine_query_terms(query)
     query_terms = [t.lower() for t in refined_terms]
+    print(f"Refined query terms: {query_terms}")
+    # --- Step 2: KG-based expansion (additive only) ---
+    kg_related_terms = []
+    original_terms_set = set(query_terms)
+    for t in query_terms:
+        try:
+            expanded = kg_expand_query(t)
+            app.logger.debug("KG expanded '%s' to: %s", t, expanded)
+            # Ensure expansion is additive: only add new terms not already present
+            for e in expanded or []:
+                if not e:
+                    continue
+                e_norm = e.strip().lower()
+                if e_norm and e_norm not in original_terms_set:
+                    kg_related_terms.append(e_norm)
+                    original_terms_set.add(e_norm)
+        except Exception as e:
+            app.logger.warning(f"⚠️ KG expand failed for term '{t}': {e}")
+    # Keep original query terms and append only added KG terms
+    query_terms = [t.lower() for t in refined_terms] + kg_related_terms
     query_lower = " ".join(query_terms)
 
-    # --- Step 1: Text search ---
-    results, result_type = run_search(query)
+    # --- Step 3: MongoDB text search ---
+    results, result_type = run_search(query_lower)
     if not isinstance(results, list):
         results = []
     all_docs = {str(r["_id"]): r for r in results}
 
-    # --- Step 2: Semantic fallback ---
-    if len(all_docs) < 5:
-        sem_results = semantic_search(query, top_k=10)
-        for doc in sem_results:
-            fid = str(doc["_id"])
-            if fid not in all_docs:
-                all_docs[fid] = doc
+    # --- Step 4: Semantic fallback if few results ---
+    if len(all_docs) < 25:
+        try:
+            sem_results = semantic_search(query_lower, top_k=10)
+            for doc in sem_results:
+                fid = str(doc["_id"])
+                if fid not in all_docs:
+                    all_docs[fid] = doc
+        except Exception as e:
+            app.logger.warning(f"Semantic fallback skipped: {e}")
 
-    # --- Step 3: Department filter ---
+    # --- Step 5: Department filter ---
     if department_filter:
         all_docs = {
-            k: v for k, v in all_docs.items()
+            k: v
+            for k, v in all_docs.items()
             if v.get("department", "").lower() == department_filter.lower()
         }
 
-    # --- Step 4: Scoring, boosts, snippets ---
+    # --- Step 6: Scoring + snippets ---
     clean_results = []
     for doc in all_docs.values():
-        # Prepare full text
         full_text = doc.get("data") or doc.get("search_text") or ""
         if isinstance(full_text, list):
             full_text = " ".join(map(str, full_text))
@@ -2039,25 +3181,34 @@ def search():
 
         text_lower = full_text.lower()
         tokens = re.findall(r'\b\w+\b', text_lower)
+        kg_boost = 0
 
-        # Phrase and term counts
+        for t in query_terms:
+            try:
+                score = kg_entity_importance(t) or 0.0
+                if score > 0:
+                    app.logger.debug(f"  KG entity '{t}' contributes: {score}")
+                    kg_boost += math.log1p(score)
+            except Exception as e:
+                app.logger.warning(f"KG importance lookup failed for term '{t}': {e}")
+
+        if kg_boost > 0:
+            kg_boost = math.log1p(kg_boost) * 0.4
+
         phrase_pattern = r'\b' + r'\s+'.join(re.escape(term) for term in query_terms) + r'\b'
         phrase_count = len(re.findall(phrase_pattern, text_lower))
         term_count = sum(tokens.count(term) for term in query_terms)
 
-        # Weight and boost
         weight = (phrase_count * 2.0) + (term_count * 0.2)
-        boost = min(2.0, math.log1p(weight))
+        boost = min(2.0, math.log1p(weight)) + kg_boost
         base_score = float(doc.get("score") or doc.get("semantic_score") or 0.0)
         final_score = base_score + boost
 
-        # Snippet generation
         snippet = make_snippet(full_text, query)
         if not snippet:
             snippet = full_text[:150] + "..." if len(full_text) > 150 else full_text
 
-        # Save document info
-        result_item = {
+        clean_results.append({
             "_id": str(doc["_id"]),
             "filename": doc.get("filename", "unknown"),
             "filetype": doc.get("filetype", "unknown"),
@@ -2065,61 +3216,126 @@ def search():
             "score": round(final_score, 3),
             "phrase_hits": phrase_count,
             "word_hits": term_count,
-            "boost": round(boost, 3)
-        }
-        clean_results.append(result_item)
+            "boost": round(boost, 3),
+            "kg_boost": round(kg_boost, 3),
+        })
 
-    # Sort by score descending
     clean_results.sort(key=lambda x: x["score"], reverse=True)
 
-    # Filter out zero-hit docs if multiple exist
+    # --- Step 7: Filter weak results ---
     if len(clean_results) > 1:
-        filtered = [r for r in clean_results if r["phrase_hits"] > 0 or r["word_hits"] > 0]
+        filtered = [r for r in clean_results if r["phrase_hits"] > 0 and r["word_hits"] > 0]
         if filtered:
             clean_results = filtered
 
-    # --- Step 5: Summarize top documents ---
+    # --- Step 8: ONNX reranker (optional) ---
+    try:
+        docs_for_rerank = [
+            (r["_id"], all_docs[r["_id"]].get("search_text", "")[:1000])
+            for r in clean_results[:20]
+        ]
+        texts = [t for _, t in docs_for_rerank]
+        scored = rerank_with_onnx(query, texts, top_k=10)
+        for (doc_id, _), s in zip(docs_for_rerank, scored):
+            for r in clean_results:
+                if r["_id"] == doc_id:
+                    r["rerank_score"] = s["score"]
+        clean_results.sort(key=lambda x: x.get("rerank_score", x["score"]), reverse=True)
+    except Exception as e:
+        app.logger.warning(f"ONNX reranker skipped: {e}")
+
+    # --- Step 9: Summarize top docs using KG ---
     final_summary = None
     if summarize_flag and clean_results:
-        combined_summaries = []
-        for result_item in clean_results[:3]:  # top 3 docs
-            doc = all_docs.get(result_item["_id"])
-            if not doc:
-                continue
-
-            full_text = doc.get("data") or doc.get("search_text") or ""
-            if isinstance(full_text, list):
-                full_text = " ".join(map(str, full_text))
-            elif isinstance(full_text, dict):
-                full_text = " ".join(f"{k}: {v}" for k, v in full_text.items())
-            elif not isinstance(full_text, str):
-                full_text = str(full_text)
-
+        kg_terms = []
+        original_terms_set = set(query_terms)
+        for t in query_terms:
             try:
-                focused_summary = summarize_relevant_chunks(
-                    full_text,
-                    query,
-                    summarizer=summarizer,
-                    min_para_len=250,
-                    max_chunks=10,
-                    chunk_size=2500,
-                    overlap=200,
-                    min_summary_len=100,
-                    max_summary_len=300
-                )
-                if focused_summary:
-                    combined_summaries.append(focused_summary)
+                expanded = kg_expand_query(t)
+                for e in expanded or []:
+                    if not e:
+                        continue
+                    e_norm = e.strip().lower()
+                    if e_norm and e_norm not in original_terms_set:
+                        kg_terms.append(e_norm)
+                        original_terms_set.add(e_norm)
+            except Exception:
+                continue
+        kg_terms = list(dict.fromkeys(kg_terms))
+
+        try:
+            kg_failures = kg_get_related_failures(query_terms + kg_terms)
+            app.logger.info(f"KG returned {len(kg_failures)} related failure records.")
+        except Exception as e:
+            app.logger.warning(f"KG failure fetch skipped: {e}")
+            kg_failures = []
+
+        kg_context_blocks = []
+        for f in kg_failures:
+            text_block = (
+                f"Failure Entry No: {f.get('failure_entry_no','')} | "
+                f"Zone: {f.get('zone','')} | Division: {f.get('division','')} | "
+                f"Section: {f.get('section','')} | Station: {f.get('station_code','')} | "
+                f"Department: {f.get('department','')} | Gear: {f.get('gear_name','')} | "
+                f"Cause: {f.get('cause','')} | Action: {f.get('action','')} | "
+                f"Remarks: {f.get('remarks','')}"
+            )
+            if text_block.strip():
+                kg_context_blocks.append(text_block)
+
+        if not kg_context_blocks or all(len(b.strip()) < 10 for b in kg_context_blocks):
+            for result_item in clean_results[:3]:
+                doc = all_docs.get(result_item["_id"])
+                if not doc:
+                    continue
+                full_text = doc.get("search_text") or doc.get("data") or ""
+                if isinstance(full_text, dict):
+                    full_text = " ".join(f"{k}:{v}" for k,v in full_text.items())
+                kg_context_blocks.append(full_text[:1000])
+
+        combined_text = "\n".join(kg_context_blocks)
+        chunks = chunk_text(combined_text, max_tokens=500, overlap=50)
+        top_chunks = select_top_chunks(chunks, query, top_k=3)
+
+        summaries = []
+        for chunk in top_chunks:
+            prompt = f"""
+You are a railway technical assistant. Analyze the failure records below.
+Focus on:
+- Failure trends and causes
+- Gear types involved
+- Actions taken and their effectiveness
+- Any preventive recommendations
+
+Provide a structured summary suitable for a control office failure analysis report.
+
+Data:
+{chunk}
+"""
+            try:
+                output_list = llm_pipe(
+    prompt,
+    do_sample=True,
+    temperature=0.7,
+    top_p=0.9,
+    top_k=50,
+    max_new_tokens=200,
+    eos_token_id=tokenizer.eos_token_id,
+    return_full_text=False
+)
+                generated_text = output_list[0]["generated_text"]
+                summaries.append(generated_text.strip())
             except Exception as e:
-                app.logger.error(f"Failed to summarize document {result_item['_id']}: {e}", exc_info=True)
+                app.logger.error(f"KG summarization failed: {e}")
+                summaries.append(chunk[:300])
 
-        if combined_summaries:
-            final_summary = "\n\n".join(combined_summaries)
+        final_summary = "\n\n".join(summaries[:3])
 
-    # --- Step 6: Optional analysis ---
+    # --- Step 10: Optional text analysis ---
     file_text = " ".join([r.get("_snippet", "") for r in clean_results])
     analysis = analyze_text_summary(file_text) if analyze_flag else None
 
-    # --- Step 7: Response ---
+    # --- Step 11: Response ---
     response = {"type": "mixed", "results": clean_results}
     if final_summary:
         response["summary"] = final_summary
@@ -2282,4 +3498,13 @@ def admin_rebuild_faiss():
 
 
 if __name__ == "__main__":
-    serve(app, host="10.206.41.36", port=5006)
+    # Try to use waitress (production-like). If that fails (binding issues,
+    # missing package, or running on a dev machine), fall back to Flask's
+    # built-in server so the developer sees console output and the app runs.
+    try:
+        print("Starting server with waitress on 10.206.41.36:5006")
+        serve(app, host="10.206.41.36", port=5006)
+    except Exception as e:
+        print(f"Waitress failed: {e}. Falling back to Flask dev server on 127.0.0.1:5006")
+        # Use a loopback address for local development so binding works reliably.
+        app.run(host="127.0.0.1", port=5006, debug=True)

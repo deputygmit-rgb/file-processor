@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Notebook-style UI</title>
+  <link rel="stylesheet" href="/static/notebook.css">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
+</head>
+<body>
+  <div id="nb-root" class="nb-root">
+    <aside class="nb-left">
+      <div class="nb-left-header">
+        <h5>Files</h5>
+        <input id="nb-search" class="form-control form-control-sm" placeholder="Search files..." />
+      </div>
+      <div id="nb-file-list" class="nb-file-list">
+        {%- if files %}
+          {%- for f in files %}
+            <div class="nb-file-item" data-file-id="{{ f._id }}">
+              <div class="nb-file-title">{{ f.filename }}</div>
+              <div class="nb-file-meta">{{ f.filetype }} • {{ f.upload_time.strftime('%Y-%m-%d') }}</div>
+            </div>
+          {%- endfor %}
+        {%- else %}
+          <div class="nb-placeholder">No files provided by server. You can wire an API endpoint to return a files list.</div>
+        {%- endif %}
+      </div>
+      <div class="nb-left-footer">
+        <button id="nb-upload-btn" class="btn btn-sm btn-outline-primary">Upload</button>
+      </div>
+    </aside>
+
+    <main class="nb-center">
+      <div class="nb-chat-header">
+        <h4 id="nb-chat-title">Notebook — Chat</h4>
+        <div id="nb-selected-file" class="text-muted small">No file selected</div>
+      </div>
+      <div id="nb-chat-area" class="nb-chat-area">
+        <!-- conversation items will be appended here -->
+      </div>
+      <div class="nb-chat-input">
+        <textarea id="nb-query" class="form-control" rows="2" placeholder="Ask something about the selected file..."></textarea>
+        <div class="d-flex justify-content-end mt-2">
+          <button id="nb-send" class="btn btn-primary">Send</button>
+        </div>
+      </div>
+    </main>
+
+    <aside class="nb-right" id="nb-preview">
+      <div class="nb-preview-header">Preview</div>
+      <div id="nb-preview-content" class="nb-preview-content">
+        <div class="nb-preview-empty">Select a file to preview its content.</div>
+      </div>
+    </aside>
+  </div>
+
+  <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+  <script src="/static/notebook.js"></script>
+</body>
+</html>

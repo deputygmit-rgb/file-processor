@@ -1,0 +1,24 @@
+/* Minimal NotebookLM-like styling: left list, center chat, right preview */
+body, html { height: 100%; margin: 0; font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; }
+.nb-root { display: grid; grid-template-columns: 280px 1fr 360px; height: 100vh; }
+.nb-left { border-right: 1px solid #e6e6e6; padding: 12px; display:flex; flex-direction:column; }
+.nb-left-header { margin-bottom: 8px; }
+.nb-file-list { overflow-y: auto; flex:1; }
+.nb-file-item { padding: 8px; border-radius:6px; cursor:pointer; margin-bottom:6px; }
+.nb-file-item:hover { background: #f6f8fb; }
+.nb-file-item.active { background: linear-gradient(90deg,#e9f0ff,#f7fbff); border-left:3px solid #2b7cff; }
+.nb-file-title { font-weight:600; font-size:0.95rem; }
+.nb-file-meta { font-size:0.75rem; color:#666; }
+.nb-left-footer { padding-top:8px; }
+.nb-center { display:flex; flex-direction:column; }
+.nb-chat-header { border-bottom:1px solid #eee; padding:10px 12px; }
+.nb-chat-area { flex:1; padding:12px; overflow-y:auto; background:#fbfcfe; }
+.nb-chat-item { margin-bottom:12px; }
+.nb-chat-item .who { font-weight:600; font-size:0.85rem; }
+.nb-chat-item .msg { margin-top:6px; padding:10px; background:#fff; border:1px solid #eee; border-radius:6px; }
+.nb-chat-input { border-top:1px solid #eee; padding:10px 12px; }
+.nb-right { border-left:1px solid #e6e6e6; padding:12px; display:flex; flex-direction:column; }
+.nb-preview-header { font-weight:700; margin-bottom:10px; }
+.nb-preview-content { overflow:auto; flex:1; background:#fff; border:1px solid #f0f0f0; padding:10px; border-radius:6px; }
+.nb-preview-empty { color:#777; font-size:0.95rem; }
+@media (max-width: 900px) { .nb-root { grid-template-columns: 1fr; grid-template-rows: 200px 1fr 300px; } .nb-right { order:3 } }

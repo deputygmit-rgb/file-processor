@@ -10,8 +10,10 @@
 
   </div>
 
-  <!-- Tabs -->
-  <div class="tabs">
+  <!-- File-scoped Tabs -->
+  <div id="file-{{ file._id }}">
+    <!-- Tabs -->
+    <div class="tabs">
     {% set search_terms = query.split() %}
     {% if file.filetype == 'pdf' %}
       {% for page in file.data %}
@@ -37,9 +39,9 @@
         </div>
       {% endfor %}
     {% endif %}
-  </div>
+    </div>
 
-  <!-- Tab Contents -->
+    <!-- Tab Contents -->
   {% macro highlight_text(text, terms) %}
     {% for term in terms %}
       {% set text = text|replace(term, '<span class="highlight">' ~ term ~ '</span>', ignorecase=True) %}
@@ -84,6 +86,7 @@
       </div>
     {% endfor %}
   {% endif %}
+  </div>
 </div>
 
 <style>

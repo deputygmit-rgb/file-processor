@@ -1,0 +1,28 @@
+{
+  "os": "Windows-11-10.0.26200-SP0",
+  "python": "CPython 3.13.7",
+  "startedAt": "2025-10-17T12:24:21.331413Z",
+  "program": "C:\\Users\\jetel\\OneDrive\\Desktop\\coding\\29092025\\file_processor\\project\\Scripts\\train_lora_cpu.py",
+  "codePath": "train_lora_cpu.py",
+  "codePathLocal": "train_lora_cpu.py",
+  "git": {
+    "remote": "https://github.com/deputygmit-rgb/file-processor.git",
+    "commit": "cf10fa51759b87e13d891b5048e107939b185d6c"
+  },
+  "email": "deputygmit@gmail.com",
+  "root": "C:\\Users\\jetel\\OneDrive\\Desktop\\coding\\29092025\\file_processor\\project\\Scripts",
+  "host": "hp",
+  "executable": "C:\\Users\\jetel\\OneDrive\\Desktop\\coding\\29092025\\file_processor\\project\\Scripts\\python.exe",
+  "cpu_count": 14,
+  "cpu_count_logical": 20,
+  "disk": {
+    "/": {
+      "total": "511603372032",
+      "used": "223598440448"
+    }
+  },
+  "memory": {
+    "total": "16833392640"
+  },
+  "writerId": "gfd8vf4yfbqcy0z38sdydkwi1onymxhk"
+}
