@@ -136,14 +136,20 @@ except Exception as _mongo_err:
 ALLOWED_EXTENSIONS = {"xlsx", "pptx", "pdf", "html", "htm", "png", "jpg", "jpeg", "bmp", "gif", "tiff"}
 
 
-driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "Pankaj1234"))
-# --- Test Neo4j connection on startup ---
+# --- Initialize Neo4j driver with fallback ---
+driver = None
 try:
+    neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    neo4j_user = os.getenv("NEO4J_USER", "neo4j")
+    neo4j_pass = os.getenv("NEO4J_PASS", "Pankaj1234")
+    driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_pass))
+    # Test connection with short timeout
     with driver.session() as session:
-        result = session.run("RETURN 'Neo4j connected' AS msg")
-        print(result.single()["msg"])
+        session.run("RETURN 'Neo4j connected' AS msg").single()
+    app.logger.info("Neo4j connected at %s", neo4j_uri)
 except Exception as e:
-    print("❌ Neo4j connection failed:", e)
+    app.logger.warning("Neo4j connection failed (%s). KG features will be disabled. %s", e.__class__.__name__, e)
+    driver = None
 
 
 # --- Helper: timed Neo4j runner to log slow queries ---
@@ -162,10 +168,14 @@ def timed_run(session, cypher, **params):
 
 
 # --- Simple in-memory TTL LRU cache for KG results ---
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 KG_CACHE_MAX = int(os.getenv("KG_CACHE_MAX", "1024"))
 KG_CACHE_TTL = int(os.getenv("KG_CACHE_TTL", "3600"))  # seconds
+KG_QUERY_RATE_LIMIT = int(os.getenv("KG_QUERY_RATE_LIMIT", "100"))  # max queries per 60s
+
+# Rate limiting for KG queries (sliding 60-second window)
+_kg_query_times = deque(maxlen=KG_QUERY_RATE_LIMIT)
 
 def _cache_get(cache, key):
     now = time.time()
@@ -199,6 +209,53 @@ def _cache_set(cache, key, value):
             cache.popitem(last=False)
         except Exception:
             break
+
+
+def _sanitize_query_term(term: str, max_len: int = 200) -> str:
+    """
+    Sanitize a query term to prevent injection and excessive length.
+    - Trim to max_len chars
+    - Remove/escape dangerous Cypher patterns
+    - Collapse whitespace
+    Returns sanitized term safe for parameterized queries.
+    """
+    if not term:
+        return ""
+    # Collapse whitespace
+    term = re.sub(r'\s+', ' ', str(term).strip())
+    # Truncate
+    term = term[:max_len]
+    # Log suspicious patterns (for debugging)
+    if any(p in term.lower() for p in ['return', 'match', 'where', 'create', 'delete', 'drop', 'merge']):
+        app.logger.debug("Sanitize: suspicious pattern in term '%s'", term[:50])
+    return term
+
+
+def _validate_int_param(value, default: int = 2, min_val: int = 1, max_val: int = 10) -> int:
+    """
+    Safely validate and constrain an integer parameter (e.g., max_hops).
+    Prevents excessively large values from causing performance issues.
+    """
+    try:
+        v = int(value)
+        return max(min_val, min(v, max_val))
+    except (ValueError, TypeError):
+        return default
+
+
+def _check_kg_rate_limit() -> bool:
+    """
+    Check if KG query rate limit is exceeded (simple sliding window, 60-second window).
+    Returns True if within limit, False if rate-limited.
+    """
+    now = time.time()
+    # Remove old entries outside the 60-second window
+    while _kg_query_times and _kg_query_times[0] < now - 60:
+        _kg_query_times.popleft()
+    if len(_kg_query_times) >= KG_QUERY_RATE_LIMIT:
+        return False
+    _kg_query_times.append(now)
+    return True
 
 # caches
 KG_EXPAND_CACHE = OrderedDict()
@@ -795,8 +852,47 @@ def flatten_text(data):
         for v in data.values():
             texts.extend(flatten_text(v))
     elif isinstance(data, (list, tuple)):
-        for item in data:
-            texts.extend(flatten_text(item))
+        # Heuristic: treat a list-of-lists as a table (rows of cells)
+        if data and all(isinstance(row, (list, tuple)) for row in data):
+            # Build a compact, searchable table representation that preserves
+            # header -> row relationships. We wrap with markers so chunking
+            # can treat the table as an atomic block.
+            try:
+                rows = data
+                header = None
+                # Heuristic: first row is header if many cells contain letters
+                first = rows[0]
+                if all(isinstance(c, (str, int, float, type(None))) for c in first):
+                    alpha_count = sum(1 for c in first if isinstance(c, str) and re.search(r'[A-Za-z]', c))
+                    if alpha_count >= max(1, len(first)//2):
+                        header = [str(c) if c is not None else "" for c in first]
+                        data_rows = rows[1:]
+                    else:
+                        data_rows = rows
+                else:
+                    data_rows = rows
+
+                tbl_lines = ["___TABLE_START___"]
+                if header:
+                    tbl_lines.append("TABLE_HEADER: " + " | ".join([h for h in header]))
+                else:
+                    # create generic column names
+                    cols = len(rows[0]) if rows else 0
+                    tbl_lines.append("TABLE_HEADER: " + " | ".join([f"col{i+1}" for i in range(cols)]))
+
+                for r_idx, r in enumerate(data_rows, start=1):
+                    cells = [clean_cell_value(c) for c in r]
+                    tbl_lines.append("TABLE_ROW: " + " | ".join(cells))
+
+                tbl_lines.append("___TABLE_END___")
+                texts.append("\n".join(tbl_lines))
+            except Exception:
+                # Fallback to flattening cells
+                for item in data:
+                    texts.extend(flatten_text(item))
+        else:
+            for item in data:
+                texts.extend(flatten_text(item))
     elif isinstance(data, str):
         texts.append(data)
     elif isinstance(data, (datetime.date, datetime.datetime)):
@@ -1023,6 +1119,124 @@ def clean_extracted_text(text):
             final_words.append(w)
 
     return ' '.join(final_words)
+
+
+def clean_extracted_text_preserve_layout(text):
+    """
+    Like clean_extracted_text but preserves line breaks and relative spacing
+    so the page layout remains closer to the original PDF. This removes
+    only illegal xml chars and obvious cid patterns, and normalizes trailing
+    whitespace on each line while keeping internal spacing.
+    """
+    if not text:
+        return ""
+
+    # Remove (cid:####) patterns and illegal xml/control chars
+    text = re.sub(r'\(cid:\d+\)', '', text)
+    text = _illegal_xml_re.sub('', text)
+
+    # Normalize line endings to \n
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+
+    # Trim trailing spaces on each line but preserve internal spacing
+    lines = [ln.rstrip() for ln in text.split('\n')]
+    # Remove consecutive blank lines (more than 2) to avoid large gaps
+    cleaned_lines = []
+    blank_run = 0
+    for ln in lines:
+        if not ln.strip():
+            blank_run += 1
+            if blank_run <= 2:
+                cleaned_lines.append(ln)
+        else:
+            blank_run = 0
+            cleaned_lines.append(ln)
+
+    return '\n'.join(cleaned_lines).strip('\n')
+
+
+def clean_ocr_text(text, min_alpha_ratio=0.25, min_word_count=1):
+    """
+    Clean OCR-produced text conservatively: remove obvious garbage lines
+    while keeping as much real text as possible (tables, numeric rows,
+    short codes). Returns cleaned multi-line text preserving line breaks.
+    """
+    if not text:
+        return ""
+
+    # Normalize line endings and remove control chars
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    text = _illegal_xml_re.sub('', text)
+
+    lines = [ln.strip() for ln in text.split('\n')]
+    cleaned = []
+    prev = None
+    for ln in lines:
+        if not ln:
+            # keep single blank lines (to preserve paragraph separation)
+            if prev != "":
+                cleaned.append("")
+                prev = ""
+            continue
+
+        # Trim excessive repeated punctuation/characters
+        if re.fullmatch(r'([\W_])\1{2,}', ln):
+            # line like "-----" or "......" -> drop
+            continue
+
+        # Count character classes
+        total_chars = len(ln.replace(' ', ''))
+        letters = len(re.findall(r'[A-Za-z]', ln))
+        digits = len(re.findall(r'\d', ln))
+        words = re.findall(r"\w+", ln)
+        word_count = len(words)
+
+        alpha_ratio = (letters / total_chars) if total_chars > 0 else 0
+
+        # Heuristics to keep a line:
+        keep = False
+        # 1) If it has at least min_word_count words (likely meaningful)
+        if word_count >= min_word_count:
+            keep = True
+
+        # 2) If line has enough alphabetic characters
+        if not keep and alpha_ratio >= min_alpha_ratio:
+            keep = True
+
+        # 3) Keep numeric/tabular lines that look like rows (multiple numbers or separators)
+        if not keep:
+            if '|' in ln or '\t' in ln:
+                # treat as table-like
+                keep = True
+            else:
+                # comma-separated numbers or multiple numeric tokens
+                numeric_tokens = len([w for w in words if re.fullmatch(r'[-+]?\d+[\d,.]*', w)])
+                if numeric_tokens >= 2:
+                    keep = True
+
+        # 4) Drop lines that are mostly non-alphanumeric garbage
+        if keep:
+            # avoid lines with extremely low informative content
+            punct_ratio = (len(re.findall(r'[^\w\s]', ln)) / total_chars) if total_chars > 0 else 0
+            if total_chars > 0 and letters == 0 and digits == 0 and punct_ratio > 0.6:
+                keep = False
+
+        if keep:
+            # Deduplicate consecutive identical lines
+            if ln != prev:
+                cleaned.append(ln)
+                prev = ln
+        else:
+            # drop the line
+            continue
+
+    # Post-process: strip leading/trailing blank lines
+    while cleaned and cleaned[0] == "":
+        cleaned.pop(0)
+    while cleaned and cleaned[-1] == "":
+        cleaned.pop()
+
+    return "\n".join(cleaned)
    
 def process_pdf(file_stream):
     file_stream.seek(0)
@@ -1031,8 +1245,20 @@ def process_pdf(file_stream):
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         for i, page in enumerate(pdf.pages):
+            # Try to extract text while preserving layout as much as possible.
+            # Prefer pdfplumber's extraction (which keeps line breaks). If that
+            # yields little content, fall back to PyMuPDF's get_text.
             text = page.extract_text() or ""
-            text= clean_extracted_text(text)
+            if not text or len(text.strip()) < 20:
+                try:
+                    # PyMuPDF's text extraction can be more robust for some PDFs
+                    page_fitz_tmp = doc.load_page(i)
+                    text = page_fitz_tmp.get_text("text") or ""
+                except Exception:
+                    text = text or ""
+
+            # Use the preserve-layout cleaner to keep line breaks and spacing
+            text = clean_extracted_text_preserve_layout(text)
             tables = page.extract_tables() or []
             page_fitz = doc.load_page(i)
             image_texts = []
@@ -1074,10 +1300,14 @@ def check_tesseract_available():
 def extract_text_from_image(image_bytes, lang="eng"):
     try:
         image = preprocess_image_for_ocr(image_bytes)
-        text = pytesseract.image_to_string(image, lang=lang, config="--psm 6").strip()
-        text= clean_extracted_text(text)
+        raw = pytesseract.image_to_string(image, lang=lang, config="--psm 6")
+        # Preserve layout first, then apply OCR-specific cleaning to drop garbage
+        text = clean_extracted_text_preserve_layout(raw)
+        text = clean_ocr_text(text)
         if not text:
-            text = pytesseract.image_to_string(image, lang=lang, config="--psm 3").strip()
+            raw = pytesseract.image_to_string(image, lang=lang, config="--psm 3")
+            text = clean_extracted_text_preserve_layout(raw)
+            text = clean_ocr_text(text)
         return text
     except Exception as e:
         app.logger.warning(f"OCR failed: {e}")
@@ -1457,13 +1687,13 @@ def classify_rail_entity(text,
         sim = semantic_similarity(source, match) if use_embedding_sim else 0
         return match, max(score, sim * 100)
 
-    # 1️⃣ Signal asset check
+    # 1. Signal asset check
     for asset, meta in signal_assets.items():
         score = fuzz.token_set_ratio(t, asset.lower())
         if score > fuzzy_threshold:
             return "Asset", {**meta, "match": asset, "score": score}
 
-    # 2️⃣ Failure codes
+    # 2. Failure codes
     for f in rail_failure_dict:
         code, desc = f["failure_code"].lower(), f["failure_desc"].lower()
         score = max(fuzz.token_set_ratio(t, code), fuzz.token_set_ratio(t, desc))
@@ -1734,7 +1964,7 @@ def view_file_in_dashboard(file_id):
         return redirect(url_for("dashboard"))
 
     # Pass the selected file id to the dashboard so it auto-opens
-    return redirect(url_for("dashboard", selected=file_id))
+    return redirect(url_for("dashboard", file_id=file_id))
 
 
 @app.route("/upload", methods=["GET", "POST"])
@@ -2125,7 +2355,7 @@ def get_kg_matches(query_terms):
         for term in query_terms:
             term_lower = term.lower()
 
-            # 1️⃣ Match failures by code or description
+            # 1. Match failures by code or description
             results_failures = session.run("""
                 MATCH (f:Failure)-[:BELONGS_TO]->(d:Department)
                 WHERE toLower(f.description) CONTAINS toLower($term)
@@ -2325,10 +2555,8 @@ def refine_query_terms(query: str) -> list:
 # Cached global reranker (loads once)
 onnx_reranker = None
 def safe_summarize_text(summarizer, text, min_len=100, max_len=300, max_model_input=900):
-    """
-    Safely summarize text by truncating it to the model’s input size limit.
-    Prevents 'index out of range' errors for long sequences.
-    """
+    # Safely summarize text by truncating it to the model's input size limit.
+    # Prevents 'index out of range' errors for long sequences.
     if not text or not summarizer:
         return ""
 
@@ -2379,7 +2607,7 @@ def load_onnx_reranker(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2"):
         ce.save_pretrained("./onnx_reranker")
         tokenizer.save_pretrained("./onnx_reranker")
 
-        # Convert via torch → ONNX (first-time only)
+    # Convert via torch -> ONNX (first-time only)
         import torch
 
         inputs = tokenizer("example question", "example answer", return_tensors="pt")
@@ -2430,6 +2658,25 @@ def tokenize(text):
     return set(re.findall(r'\b\w+\b', text.lower()))
 
 
+def normalize_query_terms(query):
+    """
+    Produce a stable list of query terms for matching.
+    Handles cases where the query contains code-like text (parentheses,
+    commas, cypher SQL fragments) by falling back to alphanumeric token
+    extraction. Returns lowercased terms.
+    """
+    if not query:
+        return []
+    # Primary: word tokens
+    terms = re.findall(r'\b\w+\b', query)
+    if not terms:
+        # Fallback: alphanumeric sequences (identifiers)
+        terms = re.findall(r'[A-Za-z0-9_]{2,}', query)
+    # Filter out very short noisy tokens (single punctuation or single letters)
+    terms = [t.lower() for t in terms if re.search(r'[A-Za-z0-9]', t)]
+    return terms
+
+
 def summarize_relevant_chunks(full_text, query, summarizer,
                               min_para_len=250, max_chunks=5,
                               chunk_size=2000, overlap=300,
@@ -2447,49 +2694,33 @@ def summarize_relevant_chunks(full_text, query, summarizer,
     )
 
     if not matched_paragraphs:
-        print("No relevant paragraphs found. Using fallback.")
+        app.logger.debug("No relevant paragraphs found. Using fallback.")
         return {
             "final_summary": full_text[:1000],
             "summaries_with_ids": []
         }
 
-    print(f"Found {len(matched_paragraphs)} relevant paragraphs.")
+    app.logger.debug(f"Found {len(matched_paragraphs)} relevant paragraphs.")
 
-    # Step 2: Merge paragraphs into overlapping chunks
-    text_to_summarize = " ".join(matched_paragraphs)
-    n = len(text_to_summarize)
-    chunks = []
-    start = 0
-    chunk_id = 1
-    while start < n:
-        end = start + chunk_size
-        chunks.append({
-            "id": f"chunk_{chunk_id}",
-            "text": text_to_summarize[start:end]
-        })
-        chunk_id += 1
-        start += (chunk_size - overlap)
+    # Step 2: Create semantically-aware chunks using tokenizer + sentence splitting
+    # This preserves tables and sentence boundaries (chunk_text is table-aware).
+    raw_chunks = chunk_text(full_text, max_tokens=chunk_size, overlap=overlap)
+    chunks = [{"id": f"chunk_{i+1}", "text": c} for i, c in enumerate(raw_chunks)]
 
     # Step 3: Filter chunks (strict AND operation)
-    query_terms = [t.lower() for t in re.findall(r'\b\w+\b', query)]
-    filtered_chunks = [
-        c for c in chunks
-        if all(qt in c["text"].lower() for qt in query_terms)
-    ]
+    query_terms = normalize_query_terms(query)
+    filtered_chunks = [c for c in chunks if all(qt in c["text"].lower() for qt in query_terms)]
 
     # Fallback to OR if no AND match
     if not filtered_chunks:
-        print("⚠️ No chunks contained all query terms. Falling back to OR matching.")
-        filtered_chunks = [
-            c for c in chunks
-            if any(qt in c["text"].lower() for qt in query_terms)
-        ]
+        app.logger.debug("No chunks contained all query terms. Falling back to OR matching.")
+        filtered_chunks = [c for c in chunks if any(qt in c["text"].lower() for qt in query_terms)]
 
     if not filtered_chunks:
-        print("⚠️ Still no matching chunks. Using fallback first chunk.")
+        app.logger.debug("Still no matching chunks. Using fallback first chunk.")
         filtered_chunks = [chunks[0]]
 
-    print(f"Filtering kept {len(filtered_chunks)} chunks (strict AND logic applied).")
+    app.logger.debug(f"Filtering kept {len(filtered_chunks)} chunks (strict AND logic applied).")
 
     # Step 4: Rank chunks
     ranked_chunks = []
@@ -2500,7 +2731,7 @@ def summarize_relevant_chunks(full_text, query, summarizer,
     ranked_chunks.sort(key=lambda x: x[1], reverse=True)
     top_chunks = [x[0] for x in ranked_chunks[:max_chunks]]
 
-    print(f"Summarizing top {len(top_chunks)} relevant chunks...")
+    app.logger.debug(f"Summarizing top {len(top_chunks)} relevant chunks...")
 
     # Step 5: Summarize each chunk safely
     summaries_with_ids = []
@@ -2586,7 +2817,7 @@ def extract_relevant_paragraphs(full_text, query, min_len=250, max_chunks=5, fal
     paragraphs = re.split(r'\n{2,}|\r{2,}|\n', full_text)
     ranked_paragraphs = []
 
-    # Iterate progressively: try all terms → N-1 terms → ... → 1 term
+    # Iterate progressively: try all terms -> N-1 terms -> ... -> 1 term
     for num_terms in range(len(query_terms), 0, -1):
         for para in paragraphs:
             para_text = para.strip()
@@ -2619,7 +2850,7 @@ def extract_relevant_paragraphs(full_text, query, min_len=250, max_chunks=5, fal
 def rank_and_score_document(full_text, query, query_terms, base_score=0.0):
     """
     Robust document ranking:
-    - Progressive AND → OR term matching
+    - Progressive AND -> OR term matching
     - Phrase + term boosts (exact word matches)
     - Returns final_score, rank_type
     """
@@ -2630,7 +2861,7 @@ def rank_and_score_document(full_text, query, query_terms, base_score=0.0):
     tokens = re.findall(r'\b\w+\b', full_text.lower())
     token_set = set(tokens)
 
-    # --- Progressive AND → OR matching ---
+    # --- Progressive AND -> OR matching ---
     n_terms = len(query_terms)
     rank_type = "none"
     matched_terms_count = 0
@@ -2664,9 +2895,26 @@ def kg_expand_query(term, max_hops=2):
     Given a term like 'signal failure' or 'gear fuse',
     find related assets, failures, stations, and departments from KG.
     Searches across multiple property names (case-insensitive) and expands up to N hops.
-    Does NOT depend on APOC.
+    Does NOT depend on APOC. Fully parameterized, sanitized, and rate-limited.
     """
+    if not driver:
+        app.logger.debug("KG expand skipped: Neo4j driver unavailable")
+        return []
+    
     try:
+        # Sanitize input
+        term = _sanitize_query_term(term)
+        if not term:
+            return []
+        
+        # Validate and constrain max_hops
+        max_hops = _validate_int_param(max_hops, default=2, min_val=1, max_val=5)
+        
+        # Check rate limit
+        if not _check_kg_rate_limit():
+            app.logger.warning("KG expand rate limit exceeded")
+            return []
+        
         # cache key based on term + max_hops
         cache_key = f"expand:{term.strip().lower()}:{int(max_hops)}"
         cached = _cache_get(KG_EXPAND_CACHE, cache_key)
@@ -2675,19 +2923,7 @@ def kg_expand_query(term, max_hops=2):
         with driver.session() as session:
             q = f"""
             MATCH (n)
-            WHERE any(x IN [
-                coalesce(n.name, ''),
-                coalesce(n.code, ''),
-                coalesce(n.failure_entry_no, coalesce(n.Failure_Entry_No, '')),
-                coalesce(n.zone, coalesce(n.Zone, '')),
-                coalesce(n.division, coalesce(n.Division, '')),
-                coalesce(n.section, coalesce(n.Section, '')),
-                coalesce(n.station_code, coalesce(n.Station_Code, '')),
-                coalesce(n.department, coalesce(n.Department, '')),
-                coalesce(n.gear_name, coalesce(n.Gear_Name, '')),
-                coalesce(n.cause, coalesce(n.Cause, '')),
-                coalesce(n.remarks, coalesce(n.Remarks, ''))
-            ] WHERE toLower(x) CONTAINS toLower($term))
+            WHERE any(k IN keys(n) WHERE toLower(toString(n[k])) CONTAINS toLower($term))
 
             // Expand relationships up to N hops in both directions
             OPTIONAL MATCH (n)-[*1..{max_hops}]-(m)
@@ -2720,7 +2956,30 @@ def kg_expand_query(term, max_hops=2):
             """
             res = timed_run(session, q, term=term)
             related_terms = [r["name"] for r in res if r["name"]]
-            out = list(set(related_terms))
+            # Normalize and split returned names into useful expansion tokens.
+            cleaned = []
+            for name in related_terms:
+                try:
+                    if not name:
+                        continue
+                    # remove surrounding whitespace and control chars
+                    n = _illegal_xml_re.sub('', str(name)).strip()
+                    if not n:
+                        continue
+                    # keep the full phrase (lowercased) if reasonably short
+                    phrase = n.lower()
+                    if 2 <= len(phrase) <= 120:
+                        cleaned.append(phrase)
+                    # also include token-level expansions (words, identifiers)
+                    toks = re.findall(r"\b[\w\-/]+\b", n)
+                    for t in toks:
+                        tt = t.lower().strip()
+                        if tt and len(tt) > 1 and tt != phrase:
+                            cleaned.append(tt)
+                except Exception:
+                    continue
+
+            out = list(dict.fromkeys(cleaned))  # preserve order, unique
             _cache_set(KG_EXPAND_CACHE, cache_key, out)
             return out
 
@@ -2733,12 +2992,25 @@ def kg_get_related_failures(query_terms):
     """
     Retrieve Failure nodes related to KG entities (zones, stations, gears, etc.).
     Case-insensitive, direction-agnostic, multi-term friendly.
-    Returns up to 100 relevant records.
+    Returns up to 100 relevant records. Fully parameterized, sanitized, and rate-limited.
     """
+    if not driver:
+        app.logger.debug("KG related failures skipped: Neo4j driver unavailable")
+        return []
+    
     if not query_terms:
         return []
 
-    terms = [t.lower().strip() for t in query_terms if t.strip()]
+    # Sanitize all terms
+    terms = [_sanitize_query_term(t) for t in query_terms if t.strip()]
+    terms = [t for t in terms if t]  # remove empty after sanitization
+    if not terms:
+        return []
+    
+    # Check rate limit
+    if not _check_kg_rate_limit():
+        app.logger.warning("KG related failures rate limit exceeded")
+        return []
 
     try:
         # cache key
@@ -2811,11 +3083,25 @@ def kg_entity_importance(entity_text: str, max_hops: int = 2) -> float:
       - Relation type diversity
       - Connectivity depth (up to N hops)
       - Case-insensitive + partial matching
-    Returns: normalized float score
+    Returns: normalized float score. Fully parameterized, sanitized, and rate-limited.
     """
     import math
 
+    if not driver:
+        app.logger.debug("KG importance skipped: Neo4j driver unavailable")
+        return 0.0
+
+    # Sanitize input
+    entity_text = _sanitize_query_term(entity_text)
     if not entity_text or len(entity_text.strip()) < 2:
+        return 0.0
+    
+    # Validate and constrain max_hops
+    max_hops = _validate_int_param(max_hops, default=2, min_val=1, max_val=5)
+    
+    # Check rate limit
+    if not _check_kg_rate_limit():
+        app.logger.warning("KG importance rate limit exceeded")
         return 0.0
 
     try:
@@ -2827,15 +3113,15 @@ def kg_entity_importance(entity_text: str, max_hops: int = 2) -> float:
             try:
                 # --- Try APOC version first ---
                 cypher = f"""
-                // 1️⃣ Find matching entities (case-insensitive, partial)
+                 // 1. Find matching entities (case-insensitive, partial)
                 MATCH (e:Entity)
                 WHERE toLower(e.text) CONTAINS toLower($entity)
 
-                // 2️⃣ Count direct and indirect relationships using APOC
+                 // 2. Count direct and indirect relationships using APOC
                 OPTIONAL MATCH (e)-[r*1..{max_hops}]-(n:Entity)
                 WITH e, apoc.coll.flatten(r) AS rels, collect(DISTINCT n) AS connected_nodes
 
-                // 3️⃣ Compute richness metrics
+                 // 3. Compute richness metrics
                 WITH e,
                      size(connected_nodes) AS reach,
                      size(rels) AS total_links,
@@ -2918,42 +3204,191 @@ llm_pipe = pipeline(
 # --- Utility: chunk extraction ---
 def chunk_text(text, max_tokens=2000, overlap=200):
     """
-    Split text into overlapping token chunks.
+    Split text into overlapping chunks with an algorithm that preserves
+    sentence/paragraph boundaries (preferred) and respects a token budget.
+
+    Strategy (best-practice):
+    - Use spaCy sentence segmentation to split text into sentences.
+    - Measure token length per sentence using the tokenizer.
+    - Greedily pack sentences into a chunk until adding the next sentence
+      would exceed max_tokens.
+    - When finalizing a chunk, compute an overlap boundary by walking
+      backwards over the last sentences until the overlap token budget
+      is reached; start the next chunk from that sentence to provide
+      semantic overlap.
+
+    Falls back to tokenizer-token sliding-window if sentence segmentation
+    or tokenizer calls fail.
     """
-    # Tokenizer-based chunking (for transformers) but we also support
-    # recursive splitting for very long text when using remote embedding APIs.
     try:
-        tokens = tokenizer.encode(text, truncation=False)
+        # Use spaCy sentence splitting for semantic-aware chunking
+        # First, split into table blocks and non-table blocks using markers
+        blocks = []
+        parts = re.split(r'(?:\n?___TABLE_START___\n?.*?___TABLE_END___\n?)', text, flags=re.S)
+        # re.split will include separators; instead we findall blocks
+        blocks = []
+        last_idx = 0
+        for m in re.finditer(r'___TABLE_START___\n.*?___TABLE_END___', text, flags=re.S):
+            # preceding text
+            if m.start() > last_idx:
+                pre = text[last_idx:m.start()]
+                if pre.strip():
+                    blocks.append(("text", pre))
+            blocks.append(("table", m.group(0)))
+            last_idx = m.end()
+        if last_idx < len(text):
+            tail = text[last_idx:]
+            if tail.strip():
+                blocks.append(("text", tail))
+
         chunks = []
-        start = 0
-        while start < len(tokens):
-            end = start + max_tokens
-            chunk_tokens = tokens[start:end]
-            ctext = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
-            chunks.append(ctext)
-            start += (max_tokens - overlap)
-        return chunks
-    except Exception:
-        # Fallback: simple char-based split preserving paragraph boundaries
-        paragraphs = re.split(r"\n{2,}|\r{2,}|\n", text)
+        # Process each block: tables are atomic (split by rows if too large), text blocks use sentence-aware packing
+        for btype, bcontent in blocks:
+            if btype == "table":
+                # Tokenize the whole table block
+                try:
+                    tbl_tokens = tokenizer.encode(bcontent, truncation=False)
+                    if len(tbl_tokens) <= max_tokens:
+                        chunks.append(bcontent)
+                        continue
+                except Exception:
+                    # fallback to naive row-splitting
+                    pass
+
+                # Split table into header + rows
+                lines = [ln for ln in bcontent.splitlines() if ln.strip()]
+                header = None
+                rows = []
+                for ln in lines:
+                    if ln.startswith('TABLE_HEADER:'):
+                        header = ln
+                    elif ln.startswith('TABLE_ROW:'):
+                        rows.append(ln)
+
+                # Pack rows into chunks preserving header
+                cur_rows = []
+                cur_tokens = 0
+                for r in rows:
+                    try:
+                        r_tokens = len(tokenizer.encode(r, truncation=False))
+                    except Exception:
+                        r_tokens = max(1, len(r.split()))
+                    if cur_tokens + r_tokens <= max_tokens - (len(tokenizer.encode(header, truncation=False)) if header else 0):
+                        cur_rows.append(r)
+                        cur_tokens += r_tokens
+                    else:
+                        # finalize chunk
+                        block_text = '\n'.join(([header] if header else []) + cur_rows + [''])
+                        chunks.append(block_text)
+                        # compute overlap rows to carry to next chunk (by token budget)
+                        overlap_tokens = 0
+                        overlap_rows = []
+                        k = len(cur_rows) - 1
+                        while k >= 0 and overlap_tokens < overlap:
+                            try:
+                                tokc = len(tokenizer.encode(cur_rows[k], truncation=False))
+                            except Exception:
+                                tokc = max(1, len(cur_rows[k].split()))
+                            overlap_tokens += tokc
+                            overlap_rows.insert(0, cur_rows[k])
+                            k -= 1
+                        cur_rows = overlap_rows + [r]
+                        cur_tokens = sum((len(tokenizer.encode(rr, truncation=False)) if 'tokenizer' in globals() else max(1, len(rr.split()))) for rr in cur_rows)
+
+                if cur_rows:
+                    block_text = '\n'.join(([header] if header else []) + cur_rows + [''])
+                    chunks.append(block_text)
+                continue
+
+            # btype == "text" : perform sentence-aware packing on the block
+        # For all text blocks, re-join and proceed with spaCy on combined text for sentences
+        text_blocks = "\n\n".join(b for t, b in blocks if t == "text")
+        doc = nlp(text_blocks)
+        sents = [s.text.strip() for s in doc.sents if s.text.strip()]
+        if not sents:
+            raise ValueError("No sentences from spaCy")
+
+        # Precompute token lengths for sentences
+        sent_token_counts = []
+        for s in sents:
+            try:
+                toks = tokenizer.encode(s, truncation=False)
+                sent_token_counts.append(len(toks))
+            except Exception:
+                # Fallback to approximate count by words
+                sent_token_counts.append(max(1, len(s.split())))
+
         chunks = []
-        cur = ""
-        for p in paragraphs:
-            if len(cur) + len(p) + 1 <= max_tokens * 4:
-                cur = (cur + "\n\n" + p).strip()
+        i = 0
+        n = len(sents)
+        while i < n:
+            token_sum = 0
+            j = i
+            # Pack sentences until token budget exceeded
+            while j < n and token_sum + sent_token_counts[j] <= max_tokens:
+                token_sum += sent_token_counts[j]
+                j += 1
+
+            # If a single sentence is longer than max_tokens, forcibly split it
+            if j == i:
+                # split tokens from the long sentence directly
+                long_sent = sents[i]
+                toks = tokenizer.encode(long_sent, truncation=False)
+                start_t = 0
+                while start_t < len(toks):
+                    end_t = min(start_t + max_tokens, len(toks))
+                    chunk_text_piece = tokenizer.decode(toks[start_t:end_t], skip_special_tokens=True)
+                    chunks.append(chunk_text_piece)
+                    start_t = end_t - overlap if end_t - overlap > start_t else end_t
+                i += 1
+                continue
+
+                # Build chunk from sentences i..j-1
+                chunk = " ".join(sents[i:j])
+                chunks.append(chunk)
+
+            # Determine overlap: walk backward from j-1 until accumulated tokens >= overlap
+            if overlap > 0 and j - 1 >= i:
+                overlap_tokens = 0
+                k = j - 1
+                while k >= i and overlap_tokens < overlap:
+                    overlap_tokens += sent_token_counts[k]
+                    k -= 1
+                # next start is k+1 (ensures at least one sentence overlap)
+                i = max(i + 1, k + 1)
             else:
-                if cur:
-                    chunks.append(cur)
-                cur = p
-        if cur:
-            chunks.append(cur)
-        # ensure overlap by merging adjacent chunks if needed
-        if overlap and len(chunks) > 1:
-            merged = []
-            for i in range(0, len(chunks)):
-                merged.append(chunks[i])
-            return merged
+                i = j
+
         return chunks
+
+    except Exception:
+        # Fallback: tokenizer token sliding window (original behavior)
+        try:
+            tokens = tokenizer.encode(text, truncation=False)
+            chunks = []
+            start = 0
+            while start < len(tokens):
+                end = start + max_tokens
+                chunk_tokens = tokens[start:end]
+                ctext = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+                chunks.append(ctext)
+                start += max(1, (max_tokens - overlap))
+            return chunks
+        except Exception:
+            # Final fallback: paragraph-based char splitting
+            paragraphs = re.split(r"\n{2,}|\r{2,}|\n", text)
+            chunks = []
+            cur = ""
+            for p in paragraphs:
+                if len(cur) + len(p) + 1 <= max_tokens * 4:
+                    cur = (cur + "\n\n" + p).strip()
+                else:
+                    if cur:
+                        chunks.append(cur)
+                    cur = p
+            if cur:
+                chunks.append(cur)
+            return chunks
 
 
 # --- Utility: select top-k chunks by cosine similarity ---

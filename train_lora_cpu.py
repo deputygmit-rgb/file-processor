@@ -8,10 +8,10 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model, TaskType
 
-# 1️⃣ Initialize wandb
+# 1. Initialize wandb
 wandb.init(project="railway_lora_training", name="lora_distilgpt2_cpu")
 
-# 2️⃣ Load JSON dataset
+# 2. Load JSON dataset
 with open("xlsx_data.json", "r", encoding="utf-8") as f:
     raw_json = json.load(f)
 
@@ -54,14 +54,14 @@ End Time: {r['end_time']}, Failure End Date: {r['failure_end_date']}
 dataset_records = [combine_fields(r) for r in normalized_records]
 dataset = Dataset.from_list(dataset_records)
 
-# 3️⃣ Load tokenizer and model
+# 3. Load tokenizer and model
 base_model_name = "distilgpt2"
 tokenizer = AutoTokenizer.from_pretrained(base_model_name)
 tokenizer.pad_token = tokenizer.eos_token
 
 model = AutoModelForCausalLM.from_pretrained(base_model_name)
 
-# 4️⃣ LoRA adapter
+# 4. LoRA adapter
 lora_config = LoraConfig(
     r=8,
     lora_alpha=16,
@@ -72,7 +72,7 @@ lora_config = LoraConfig(
 )
 model = get_peft_model(model, lora_config)
 
-# 5️⃣ Tokenization
+# 5. Tokenization
 def tokenize_fn(batch):
     return tokenizer(batch["text"], truncation=True, padding="max_length", max_length=256)
 
@@ -80,7 +80,7 @@ tokenized_ds = dataset.map(tokenize_fn, batched=True)
 
 data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
-# 6️⃣ Training arguments with wandb
+# 6. Training arguments with wandb
 training_args = TrainingArguments(
     output_dir="./lora_railway_model",
     per_device_train_batch_size=2,
@@ -95,7 +95,7 @@ training_args = TrainingArguments(
     run_name="lora_distilgpt2_cpu",
 )
 
-# 7️⃣ Trainer
+# 7. Trainer
 trainer = Trainer(
     model=model,
     args=training_args,
@@ -104,12 +104,12 @@ trainer = Trainer(
     data_collator=data_collator
 )
 
-# 8️⃣ Train
+# 8. Train
 trainer.train()
 
-# 9️⃣ Save LoRA adapter
+# 9. Save LoRA adapter
 model.save_pretrained("./lora_railway_adapter")
 print("✅ LoRA adapter training complete!")
 
-# 1️⃣0️⃣ Finish wandb run
+# 10. Finish wandb run
 wandb.finish()

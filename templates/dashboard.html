@@ -45,6 +45,58 @@
 
   <a href="{{ url_for('upload') }}" class="btn btn-primary mb-3">Upload New File</a>
 
+  <!-- Latest uploads as an accordion list -->
+  <div class="accordion mb-4" id="latestUploadsAccordion">
+    {% for file in files %}
+      <div class="accordion-item">
+        <h2 class="accordion-header" id="heading-{{ file._id }}">
+          <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#collapse-{{ file._id }}" aria-expanded="false" aria-controls="collapse-{{ file._id }}">
+            {{ file.filename }} <small class="text-muted ms-2">({{ file.filetype|default('unknown')|upper }}){% if file.upload_time %} - {{ file.upload_time }}{% endif %}</small>
+          </button>
+        </h2>
+        <div id="collapse-{{ file._id }}" class="accordion-collapse collapse" aria-labelledby="heading-{{ file._id }}" data-bs-parent="#latestUploadsAccordion">
+          <div class="accordion-body">
+            <p><strong>Type:</strong> {{ file.filetype|default('unknown') }}</p>
+            <p><strong>Uploaded:</strong> {{ file.upload_time or 'N/A' }}</p>
+            <p><strong>Preview:</strong></p>
+            <div class="preview-text">
+              {% if file.filetype == 'pdf' and file.data and file.data[0].text %}
+                <p>{{ file.data[0].text[:500] }}{% if file.data[0].text|length > 500 %}...{% endif %}</p>
+              {% elif file.filetype == 'pptx' and file.data %}
+                <p>{{ (file.data[0].title if file.data[0].title else (file.data[0].texts[0] if file.data[0].texts else '(No preview)')) }}</p>
+              {% elif file.filetype == 'xlsx' and file.data %}
+                {% set first_sheet = file.data.keys()|list|first %}
+                {% set rows = file.data[first_sheet] if first_sheet else [] %}
+                <div class="table-responsive">
+                  <table class="table table-sm">
+                    <tbody>
+                      {% for row in rows[:3] %}
+                        <tr>
+                          {% for cell in row %}
+                            <td>{{ cell }}</td>
+                          {% endfor %}
+                        </tr>
+                      {% endfor %}
+                    </tbody>
+                  </table>
+                </div>
+              {% elif file.data and file.data.ocr_text %}
+                <p>{{ file.data.ocr_text[:500] }}{% if file.data.ocr_text|length > 500 %}...{% endif %}</p>
+              {% else %}
+                <p>(No preview available)</p>
+              {% endif %}
+            </div>
+            <div class="mt-2">
+              <a href="{{ url_for('view_file_in_dashboard', file_id=file._id) }}" class="btn btn-sm btn-outline-primary">Open in Dashboard</a>
+              <a href="{{ url_for('serve_file', file_id=file.file_id) }}" class="btn btn-sm btn-outline-secondary" target="_blank">Download</a>
+              <a href="{{ url_for('export_json', file_id=file._id) }}" class="btn btn-sm btn-outline-info" target="_blank">Export JSON</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+
   {% if not files %}
     <p>No files uploaded yet.</p>
   {% endif %}

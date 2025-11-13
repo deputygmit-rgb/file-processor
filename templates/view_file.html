@@ -52,13 +52,53 @@
   {% if file.filetype == 'pdf' %}
     {% for page in file.data %}
       <div id="page-{{ loop.index }}-{{ file._id }}" class="tab-content {% if loop.first %}active{% endif %}">
-        <pre>{{ highlight_text(page.text|default(''), search_terms) }}</pre>
+        {# Render paragraphs to preserve layout and allow highlighting per-paragraph #}
+        {% set p_text = page.text|default('') %}
+        {% if p_text.strip() %}
+          {% for para in p_text.split('\n\n') %}
+            <p>{{ highlight_text(para, search_terms) }}</p>
+          {% endfor %}
+        {% endif %}
+
+        {# Render extracted tables (if any) as HTML tables so their structure is preserved #}
+        {% if page.tables %}
+          <div class="pdf-tables mt-3">
+            {% for table in page.tables %}
+              <table class="table table-sm table-bordered">
+                {% for row in table %}
+                  <tr>
+                    {% for cell in row %}
+                      <td>{{ highlight_text(cell|string, search_terms) }}</td>
+                    {% endfor %}
+                  </tr>
+                {% endfor %}
+              </table>
+            {% endfor %}
+          </div>
+        {% endif %}
+
+        {# Render OCR texts from images if present #}
+        {% if page.image_texts %}
+          <div class="ocr-texts mt-2">
+            <h6>OCR Texts from Images</h6>
+            {% for it in page.image_texts %}
+              <p>{{ highlight_text(it, search_terms) }}</p>
+            {% endfor %}
+          </div>
+        {% endif %}
       </div>
     {% endfor %}
   {% elif file.filetype == 'pptx' %}
     {% for slide in file.data %}
       <div id="slide-{{ loop.index }}-{{ file._id }}" class="tab-content {% if loop.first %}active{% endif %}">
-        <pre>{{ highlight_text(slide.texts|join(' '), search_terms) }}</pre>
+        {% if slide.title %}
+          <h4>{{ highlight_text(slide.title, search_terms) }}</h4>
+        {% endif %}
+        {% if slide.texts %}
+          {% for para in slide.texts %}
+            <p>{{ highlight_text(para, search_terms) }}</p>
+          {% endfor %}
+        {% endif %}
         {% if slide.images %}
           <div class="mt-2">
             {% for img in slide.images %}
@@ -71,15 +111,17 @@
   {% elif file.filetype == 'xlsx' %}
     {% for sheet_name, rows in file.data.items() %}
       <div id="sheet-{{ loop.index }}-{{ file._id }}" class="tab-content {% if loop.first %}active{% endif %}">
-        <table class="table table-bordered table-sm">
-          {% for row in rows[:50] %}
-            <tr>
-              {% for cell in row %}
-                <td>{{ highlight_text(cell|string, search_terms) }}</td>
-              {% endfor %}
-            </tr>
-          {% endfor %}
-        </table>
+        <div class="sheet-table">
+          <table class="table table-bordered table-sm">
+            {% for row in rows[:50] %}
+              <tr>
+                {% for cell in row %}
+                  <td>{{ highlight_text(cell|string, search_terms) }}</td>
+                {% endfor %}
+              </tr>
+            {% endfor %}
+          </table>
+        </div>
         {% if rows|length > 50 %}
           <p class="text-muted">... preview limited to 50 rows ...</p>
         {% endif %}
